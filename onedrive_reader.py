@@ -226,6 +226,36 @@ def month_folder_names(reference_month: str | None) -> List[str]:
     return [prev, current]
 
 
+def resolve_onedrive_context(
+    auth_mode: str,
+    base_path: str | None,
+    reference_month: str | None,
+) -> tuple[str, str, List[str]]:
+    """Resolve OneDrive token, drive prefix, and target month folders."""
+    tenant_id = _require_env("TENANT_ID")
+    client_id = _require_env("CLIENT_ID")
+
+    if auth_mode == "app":
+        client_secret = _require_env("CLIENT_SECRET")
+        drive_id = _require_env("DRIVE_ID")
+        token = get_app_token(tenant_id, client_id, client_secret)
+    else:
+        drive_id = None
+        token = get_delegated_token(tenant_id, client_id)
+
+    drive_prefix = _graph_drive_prefix(auth_mode, drive_id)
+
+    months = month_folder_names(reference_month)
+    env_base = os.getenv("FOLDER_BASE_PATH") or os.getenv("BASE_PATH") or ""
+    selected_base = base_path if base_path is not None else env_base
+    base = selected_base.strip("/")
+    if base.lower().startswith("root/"):
+        base = base[5:].lstrip("/")
+    target_folders = [f"{base}/{month}" if base else month for month in months]
+
+    return token, drive_prefix, target_folders
+
+
 def download_drive_item_content(token: str, drive_prefix: str, item_id: str) -> bytes:
     url = f"{drive_prefix}/items/{item_id}/content"
     headers = {"Authorization": f"Bearer {token}"}
@@ -315,7 +345,7 @@ def extract_structured_tables(pdf_bytes: bytes) -> List[Dict[str, Any]]:
 def _ocr_page_text(page: fitz.Page) -> str:
     matrix = fitz.Matrix(2, 2)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
     # Try preferred OCR language sets first (for Baltic diacritics), then fallback.
     langs_raw = os.getenv("OCR_LANGS", "est+eng,eng")
@@ -435,7 +465,8 @@ def extract_pdf_markdown_with_fallback(pdf_bytes: bytes) -> Dict[str, Any]:
 
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for idx, page in enumerate(doc, start=1):
+        for idx in range(doc.page_count):
+            page = doc.load_page(idx)
             layout_blocks = _extract_layout_blocks(page)
 
             # Keep markdown focused on layout blocks; OCR is only a fallback when
@@ -456,7 +487,7 @@ def extract_pdf_markdown_with_fallback(pdf_bytes: bytes) -> Dict[str, Any]:
 
             layout_md = _render_layout_blocks_markdown(layout_blocks)
 
-            chunks.append(f"## Page {idx}\n\n{layout_md}")
+            chunks.append(f"## Page {idx + 1}\n\n{layout_md}")
         doc.close()
     except Exception:
         # Fallback extraction path if PyMuPDF fails for any reason.
@@ -527,20 +558,6 @@ def _ascii_clean(value: str) -> str:
     return " ".join(cleaned.split()).strip()
 
 
-def _extract_first_number(value: Any) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value or "")
-    text = text.replace(",", ".")
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return 0.0
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return 0.0
-
-
 def _parse_decimal(value: Any) -> Decimal | None:
     if isinstance(value, Decimal):
         return value
@@ -559,6 +576,15 @@ def _parse_decimal(value: Any) -> Decimal | None:
         return Decimal(match.group(0))
     except InvalidOperation:
         return None
+
+
+def _parse_boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
 
 
 def _extract_source_numbers(markdown_text: str, table_data: List[Dict[str, Any]]) -> List[Decimal]:
@@ -690,6 +716,7 @@ def normalize_invoice_data(raw: Dict[str, Any], markdown_text: str, table_data: 
                     "description": _ascii_clean(str(line.get("description", ""))),
                     "price_without_vat": _snap_to_source_amount(line.get("price_without_vat"), source_numbers),
                     "price_with_vat": _snap_to_source_amount(line.get("price_with_vat"), source_numbers),
+                    "is_car_expense": _parse_boolish(line.get("is_car_expense", False)),
                 }
             )
 
@@ -728,6 +755,9 @@ def build_invoice_extraction_prompt(markdown_text: str, table_data: List[Dict[st
         "7) Return at most 15 line objects in JSON lines array.\n"
         "8) Some rows are descriptive only. Do not create invoice lines from descriptive text rows.\n"
         "9) If a candidate line amount equals total_without_vat or total_with_vat, treat it as subtotal/total context, not a real invoice line.\n"
+        "10) For each line, set is_car_expense=true when the line clearly relates to vehicle usage/maintenance/operations.\n"
+        "    Examples: fuel, charging, parking, toll/road fee, car wash, maintenance/repair, tires, oil, spare parts, inspection, leasing/rent, mileage/transport.\n"
+        "    Otherwise set is_car_expense=false.\n"
         "\n"
         "Totals rules:\n"
         "1) Extract totals from dedicated summary rows, not from item description text.\n"
@@ -768,7 +798,8 @@ def build_invoice_extraction_prompt(markdown_text: str, table_data: List[Dict[st
         "    {\n"
         '      "description": "string",\n'
         '      "price_without_vat": 0.0,\n'
-        '      "price_with_vat": 0.0\n'
+        '      "price_with_vat": 0.0,\n'
+        '      "is_car_expense": false\n'
         "    }\n"
         "  ],\n"
         '  "total_without_vat": 0.0,\n'
@@ -901,82 +932,88 @@ def extract_invoice_data_with_cerebras(
     return parsed, ""
 
 
-def extract_invoice_data_with_openrouter(
-    markdown_text: str,
-    table_data: List[Dict[str, Any]],
-    openrouter_model: str,
+def _call_chat_completions_api(
+    endpoint: str,
+    api_key: str,
+    request_payload: Dict[str, Any],
+    provider_label: str,
 ) -> tuple[Dict[str, Any] | None, str]:
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        return None, "missing_OPENROUTER_API_KEY"
-
-    prompt = build_invoice_extraction_prompt(markdown_text, table_data)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    def _call_openrouter(request_payload: Dict[str, Any]) -> tuple[Dict[str, Any] | None, str]:
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=request_payload,
-                timeout=180,
-            )
-        except requests.exceptions.Timeout:
-            return None, "openrouter_timeout"
-        except requests.exceptions.RequestException as err:
-            return None, f"openrouter_request_failed: {str(err)[:180]}"
+    try:
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=request_payload,
+            timeout=180,
+        )
+    except requests.exceptions.Timeout:
+        return None, f"{provider_label}_timeout"
+    except requests.exceptions.RequestException as err:
+        return None, f"{provider_label}_request_failed: {str(err)[:180]}"
 
-        if response.status_code != 200:
-            body = (response.text or "").strip().replace("\n", " ")
-            return None, f"openrouter_http_{response.status_code}: {body[:180]}"
+    if response.status_code != 200:
+        body = (response.text or "").strip().replace("\n", " ")
+        return None, f"{provider_label}_http_{response.status_code}: {body[:180]}"
 
-        try:
-            return response.json(), ""
-        except ValueError:
-            body = (response.text or "").strip().replace("\n", " ")
-            return None, f"openrouter_non_json_response: {body[:180]}"
+    try:
+        return response.json(), ""
+    except ValueError:
+        body = (response.text or "").strip().replace("\n", " ")
+        return None, f"{provider_label}_non_json_response: {body[:180]}"
 
-    def _extract_message_content(resp_json: Dict[str, Any]) -> tuple[str, str]:
-        choices = resp_json.get("choices") or []
-        if not choices:
-            return "", ""
 
-        choice0 = choices[0] or {}
-        finish_reason = str(choice0.get("finish_reason") or "")
-        message = choice0.get("message") or {}
-        content = message.get("content")
+def _extract_message_content(resp_json: Dict[str, Any]) -> tuple[str, str]:
+    choices = resp_json.get("choices") or []
+    if not choices:
+        return "", ""
 
-        if isinstance(content, str):
-            return content, finish_reason
+    choice0 = choices[0] or {}
+    finish_reason = str(choice0.get("finish_reason") or "")
+    message = choice0.get("message") or {}
+    content = message.get("content")
 
-        if isinstance(content, list):
-            parts: List[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    parts.append(str(part.get("text") or ""))
-                elif isinstance(part, str):
-                    parts.append(part)
-            return "\n".join(x for x in parts if x), finish_reason
+    if isinstance(content, str):
+        return content, finish_reason
 
-        return str(content or ""), finish_reason
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(x for x in parts if x), finish_reason
+
+    return str(content or ""), finish_reason
+
+
+def _extract_invoice_data_with_chat_api(
+    markdown_text: str,
+    table_data: List[Dict[str, Any]],
+    model: str,
+    api_key: str,
+    endpoint: str,
+    provider_label: str,
+) -> tuple[Dict[str, Any] | None, str]:
+    prompt = build_invoice_extraction_prompt(markdown_text, table_data)
 
     payload = {
-        "model": openrouter_model,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": 12000,
         "response_format": {"type": "json_object"},
     }
-    resp_json, reason = _call_openrouter(payload)
+    resp_json, reason = _call_chat_completions_api(endpoint, api_key, payload, provider_label)
     if resp_json is None:
         return None, reason
 
     content, finish_reason = _extract_message_content(resp_json)
     parsed = parse_json_from_ollama_response(content)
 
-    # Retry once with tighter output instructions if JSON is malformed/truncated.
     if not parsed:
         retry_prompt = (
             prompt
@@ -985,13 +1022,13 @@ def extract_invoice_data_with_openrouter(
             + " Keep lines to real invoice item rows only."
         )
         retry_payload = {
-            "model": openrouter_model,
+            "model": model,
             "messages": [{"role": "user", "content": retry_prompt}],
             "temperature": 0,
             "max_tokens": 12000,
             "response_format": {"type": "json_object"},
         }
-        resp_json, reason = _call_openrouter(retry_payload)
+        resp_json, reason = _call_chat_completions_api(endpoint, api_key, retry_payload, provider_label)
         if resp_json is None:
             return None, reason
         content, finish_reason = _extract_message_content(resp_json)
@@ -1004,6 +1041,24 @@ def extract_invoice_data_with_openrouter(
     if not is_complete_invoice_data(parsed):
         return None, "schema_incomplete"
     return parsed, ""
+
+
+def extract_invoice_data_with_openrouter(
+    markdown_text: str,
+    table_data: List[Dict[str, Any]],
+    openrouter_model: str,
+) -> tuple[Dict[str, Any] | None, str]:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None, "missing_OPENROUTER_API_KEY"
+    return _extract_invoice_data_with_chat_api(
+        markdown_text=markdown_text,
+        table_data=table_data,
+        model=openrouter_model,
+        api_key=api_key,
+        endpoint="https://openrouter.ai/api/v1/chat/completions",
+        provider_label="openrouter",
+    )
 
 
 def extract_invoice_data_with_github_models(
@@ -1021,101 +1076,37 @@ def extract_invoice_data_with_github_models(
     ).strip()
     if not endpoint:
         return None, "missing_GITHUB_MODELS_URL"
+    return _extract_invoice_data_with_chat_api(
+        markdown_text=markdown_text,
+        table_data=table_data,
+        model=github_models_model,
+        api_key=api_key,
+        endpoint=endpoint,
+        provider_label="github_models",
+    )
 
-    prompt = build_invoice_extraction_prompt(markdown_text, table_data)
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
 
-    def _call_github_models(request_payload: Dict[str, Any]) -> tuple[Dict[str, Any] | None, str]:
+def _load_table_data_for_markdown(
+    token: str,
+    drive_prefix: str,
+    md_items: List[Dict[str, Any]],
+    tables_name: str,
+) -> List[Dict[str, Any]]:
+    for possible in md_items:
+        if str(possible.get("name", "")) != tables_name:
+            continue
+        table_item_id = possible.get("id")
+        if not table_item_id:
+            return []
+        raw_tables = download_drive_item_content(token, drive_prefix, str(table_item_id))
         try:
-            response = requests.post(
-                endpoint,
-                headers=headers,
-                json=request_payload,
-                timeout=180,
-            )
-        except requests.exceptions.Timeout:
-            return None, "github_models_timeout"
-        except requests.exceptions.RequestException as err:
-            return None, f"github_models_request_failed: {str(err)[:180]}"
-
-        if response.status_code != 200:
-            body = (response.text or "").strip().replace("\n", " ")
-            return None, f"github_models_http_{response.status_code}: {body[:180]}"
-
-        try:
-            return response.json(), ""
-        except ValueError:
-            body = (response.text or "").strip().replace("\n", " ")
-            return None, f"github_models_non_json_response: {body[:180]}"
-
-    def _extract_message_content(resp_json: Dict[str, Any]) -> tuple[str, str]:
-        choices = resp_json.get("choices") or []
-        if not choices:
-            return "", ""
-
-        choice0 = choices[0] or {}
-        finish_reason = str(choice0.get("finish_reason") or "")
-        message = choice0.get("message") or {}
-        content = message.get("content")
-
-        if isinstance(content, str):
-            return content, finish_reason
-
-        if isinstance(content, list):
-            parts: List[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    parts.append(str(part.get("text") or ""))
-                elif isinstance(part, str):
-                    parts.append(part)
-            return "\n".join(x for x in parts if x), finish_reason
-
-        return str(content or ""), finish_reason
-
-    payload = {
-        "model": github_models_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 12000,
-        "response_format": {"type": "json_object"},
-    }
-    resp_json, reason = _call_github_models(payload)
-    if resp_json is None:
-        return None, reason
-
-    content, finish_reason = _extract_message_content(resp_json)
-    parsed = parse_json_from_ollama_response(content)
-
-    if not parsed:
-        retry_prompt = (
-            prompt
-            + "\n\nIMPORTANT: Return exactly one compact JSON object only."
-            + " No markdown, no code fences, no commentary."
-            + " Keep lines to real invoice item rows only."
-        )
-        retry_payload = {
-            "model": github_models_model,
-            "messages": [{"role": "user", "content": retry_prompt}],
-            "temperature": 0,
-            "max_tokens": 12000,
-            "response_format": {"type": "json_object"},
-        }
-        resp_json, reason = _call_github_models(retry_payload)
-        if resp_json is None:
-            return None, reason
-        content, finish_reason = _extract_message_content(resp_json)
-        parsed = parse_json_from_ollama_response(content)
-
-    if not parsed:
-        suffix = f":{finish_reason}" if finish_reason else ""
-        return None, f"json_parse_failed{suffix}"
-    parsed = normalize_invoice_data(parsed, markdown_text, table_data)
-    if not is_complete_invoice_data(parsed):
-        return None, "schema_incomplete"
-    return parsed, ""
+            parsed_tables = json.loads(raw_tables.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed_tables, list):
+            return parsed_tables
+        return []
+    return []
 
 
 def extract_invoice_data(
@@ -1259,20 +1250,7 @@ def process_month_folder(
         try:
             md_bytes = download_drive_item_content(token, drive_prefix, str(item_id))
             md_text = md_bytes.decode("utf-8", errors="replace")
-            table_data: List[Dict[str, Any]] = []
-            table_item_id = None
-            for possible in md_items:
-                if str(possible.get("name", "")) == tables_name:
-                    table_item_id = possible.get("id")
-                    break
-            if table_item_id:
-                raw_tables = download_drive_item_content(token, drive_prefix, str(table_item_id))  # noqa
-                try:
-                    parsed_tables = json.loads(raw_tables.decode("utf-8", errors="replace"))
-                    if isinstance(parsed_tables, list):
-                        table_data = parsed_tables
-                except json.JSONDecodeError:
-                    table_data = []
+            table_data = _load_table_data_for_markdown(token, drive_prefix, md_items, tables_name)
 
             invoice_data, parse_reason = extract_invoice_data(
                 md_text,
@@ -1356,18 +1334,11 @@ def main() -> None:
 
     ensure_ocr_binary_available()
 
-    tenant_id = _require_env("TENANT_ID")
-    client_id = _require_env("CLIENT_ID")
-
-    if args.auth_mode == "app":
-        client_secret = _require_env("CLIENT_SECRET")
-        drive_id = _require_env("DRIVE_ID")
-        token = get_app_token(tenant_id, client_id, client_secret)
-    else:
-        drive_id = None
-        token = get_delegated_token(tenant_id, client_id)
-
-    drive_prefix = _graph_drive_prefix(args.auth_mode, drive_id)
+    token, drive_prefix, target_folders = resolve_onedrive_context(
+        auth_mode=args.auth_mode,
+        base_path=args.base_path,
+        reference_month=args.reference_month,
+    )
     llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     ollama_model = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
@@ -1375,13 +1346,7 @@ def main() -> None:
     openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
     github_models_model = os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4.1-mini")
 
-    month_folders = month_folder_names(args.reference_month)
-    env_base = os.getenv("FOLDER_BASE_PATH") or os.getenv("BASE_PATH") or ""
-    selected_base = args.base_path if args.base_path is not None else env_base
-    base = selected_base.strip("/")
-    if base.lower().startswith("root/"):
-        base = base[5:].lstrip("/")
-
+    month_folders = [x.rsplit("/", 1)[-1] for x in target_folders]
     print(f"Processing folders: {month_folders[0]}, {month_folders[1]}")
     total_processed = 0
     total_skipped = 0
@@ -1391,8 +1356,7 @@ def main() -> None:
 
     folder_scan: Dict[str, Dict[str, Any]] = {}
     total_work = 0
-    for month_folder in month_folders:
-        target_folder = f"{base}/{month_folder}" if base else month_folder
+    for target_folder in target_folders:
         try:
             scan_items = list(iter_children(token, target_folder, drive_prefix))
             pdf_count = len(
@@ -1424,8 +1388,7 @@ def main() -> None:
     progress = LiveProgress("overall", total_work)
     progress.start()
 
-    for month_folder in month_folders:
-        target_folder = f"{base}/{month_folder}" if base else month_folder
+    for target_folder in target_folders:
         scan = folder_scan.get(target_folder, {"exists": True, "md_count": 0})
         if not scan.get("exists", True):
             print(f"{target_folder}: folder missing, skipped")

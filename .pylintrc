@@ -1,0 +1,23 @@
+[MASTER]
+jobs=0
+
+[MESSAGES CONTROL]
+disable=
+    missing-function-docstring,
+    missing-class-docstring,
+    line-too-long,
+    broad-exception-caught,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-branches,
+    too-many-statements,
+    too-many-return-statements,
+    too-few-public-methods,
+    too-many-instance-attributes,
+    too-many-lines,
+    disallowed-name,
+    use-yield-from
+
+[FORMAT]
+max-line-length=160
