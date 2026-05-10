@@ -3,8 +3,8 @@
 
 Behavior:
 - Skips any parsed file that already has a .success.json or .failed.json sibling.
-- Only submits one real invoice by default: 260416.eurostauto.parsed.json
-- For all other parsed files, writes a .success.json marker without submitting.
+- Submits all parsed invoices by default.
+- If --test-file is provided, only that parsed invoice will be submitted.
 - Optional no-submit mode marks all parsed invoices as success without opening SimplBooks.
 
 Environment variables:
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +35,6 @@ from onedrive_reader import (
 )
 
 
-DEFAULT_TEST_FILE = "260416.eurostauto.parsed.json"
 DEFAULT_BASE_URL = "https://www.simplbooks.ee"
 
 
@@ -75,8 +75,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--test-file",
-        default=DEFAULT_TEST_FILE,
-        help="Only this parsed filename will be submitted to SimplBooks",
+        default=None,
+        help="If set, only this parsed filename will be submitted to SimplBooks",
     )
     parser.add_argument(
         "--base-url",
@@ -232,6 +232,57 @@ def _fill(page: Page, selector: str, value: str) -> None:
     page.locator(selector).first.fill(value, timeout=5000)
 
 
+def _close_calendar_popups(page: Page) -> None:
+    # Close datepicker overlays without Escape, because Escape can revert values
+    # back to widget defaults on this form.
+    try:
+        page.evaluate(
+            """
+            () => {
+              const active = document.activeElement;
+              if (active && typeof active.blur === 'function') active.blur();
+            }
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        page.mouse.click(5, 5)
+    except Exception:
+        pass
+
+
+def _set_date_field(page: Page, selector: str, value: str) -> None:
+    wanted = str(value or "").strip()
+    updated = bool(
+        page.evaluate(
+            """
+            ({ sel, val }) => {
+              const el = document.querySelector(sel);
+              if (!el) return false;
+              el.value = String(val || '');
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return String(el.value || '').trim() === String(val || '').trim();
+            }
+            """,
+            {"sel": selector, "val": wanted},
+        )
+    )
+    if not updated:
+        raise RuntimeError(f"Could not set date field: {selector}")
+
+
+def _fill_purchase_dates(page: Page, invoice_date: str) -> None:
+    date_value = str(invoice_date or "").strip()
+    _set_date_field(page, "#PurchaseTransactionDate", date_value)
+    _close_calendar_popups(page)
+    _set_date_field(page, "#PurchaseDue", date_value)
+    _close_calendar_popups(page)
+    _set_date_field(page, "#PurchaseCreated", date_value)
+
+
 def _format_decimal(value: Any) -> str:
     if value in (None, ""):
         return "0,00"
@@ -249,14 +300,413 @@ def _money_round(value: float) -> float:
     return round(value + 1e-9, 2)
 
 
-def _fill_supplier(page: Page, supplier_name: str) -> None:
-    input_selector = "#client-select-ts-control"
-    page.locator(input_selector).fill(supplier_name, timeout=5000)
-    page.locator(input_selector).press("Enter")
+def _parse_boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _resolve_purchase_settings(invoice: Dict[str, Any]) -> Dict[str, str]:
+    lines = invoice.get("lines")
+    has_car_expense = False
+    if isinstance(lines, list):
+        has_car_expense = any(
+            isinstance(line, dict) and _parse_boolish(line.get("is_car_expense", False))
+            for line in lines
+        )
+
+    if has_car_expense:
+        return {
+            "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_CAR_EXPENSE"),
+            "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_CAR_EXPENSE"),
+        }
+
+    if _parse_boolish(invoice.get("eu_buy", False)):
+        return {
+            "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY"),
+            "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_EU_BUY"),
+        }
+
+    return {
+        "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_DEFAULT"),
+        "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_DEFAULT"),
+    }
+
+
+def _fill_supplier(page: Page, supplier_reg_code: str) -> None:
+    reg_code = str(supplier_reg_code or "").strip()
+    if not reg_code:
+        raise RuntimeError("Supplier registration code is missing")
+
+    try:
+        page.locator('button[data-bs-target="#client-form-offcanvas"]').first.click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not click 'Muuda tarbija andmeid'") from err
+
+    try:
+        page.locator("#client-form-offcanvas").first.wait_for(state="visible", timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Supplier modal did not open") from err
+
+    reg_fields = page.locator("#PurchaseClientRegNo")
+    if reg_fields.count() == 0:
+        raise RuntimeError("Could not find supplier registration code field in modal")
+
+    # Fill only registration code; do not type into name field.
+    reg_field = reg_fields.first
+    reg_field.fill(reg_code, timeout=3000)
+    reg_field.press("Tab")
+    page.wait_for_timeout(200)
+
+    refresh_button = page.locator("#refresh-data-from-register-link")
+    if refresh_button.count() > 0 and refresh_button.first.is_visible():
+        try:
+            refresh_button.first.click(timeout=5000)
+        except Exception as err:
+            raise RuntimeError("Could not click 'Värskenda andmeid Äriregistrist'") from err
+
+        try:
+            page.wait_for_function(
+                """
+                (wantedRegCode) => {
+                    const regEl = document.querySelector('#PurchaseClientRegNo');
+                    const nameEl = document.querySelector('#PurchaseClientName');
+                    const reg = String(regEl?.value || '').trim();
+                    const name = String(nameEl?.value || '').trim();
+                    const wanted = String(wantedRegCode || '').trim();
+                    return !!reg && reg.includes(wanted) && !!name && name !== wanted;
+                }
+                """,
+                arg=reg_code,
+                timeout=15000,
+            )
+        except Exception as err:
+            raise RuntimeError("Supplier data was not refreshed and populated from Äriregister") from err
+
+    page.evaluate(
+        """
+        () => {
+            const root = document.querySelector('#client-form-offcanvas') || document;
+            const reg = root.querySelector('#PurchaseClientRegNo');
+            const keepId = reg ? reg.id : 'PurchaseClientRegNo';
+
+            const clearable = root.querySelectorAll('input, textarea');
+            for (const field of clearable) {
+                const tag = (field.tagName || '').toLowerCase();
+                const type = String(field.getAttribute('type') || '').toLowerCase();
+                const id = String(field.id || '');
+
+                if (id === keepId) continue;
+                if (tag === 'textarea' || ['text', 'email', 'tel', 'url', 'search', 'number', ''].includes(type)) {
+                    field.value = '';
+                    field.dispatchEvent(new Event('input', { bubbles: true }));
+                    field.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+        }
+        """
+    )
+
+    try:
+        page.locator("#client-form-offcanvas-submit").first.click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not click 'Korras' in supplier modal") from err
+
     page.wait_for_timeout(500)
 
 
-def _fill_purchase_row(page: Page, row_index: int, line: Dict[str, Any]) -> None:
+def _attach_invoice_pdf(page: Page, pdf_path: Path) -> None:
+    if not pdf_path.exists():
+        raise RuntimeError(f"Attachment file does not exist: {pdf_path}")
+
+    upload_path = str(pdf_path)
+
+    # Verified live control on SimplBooks purchase form.
+    for selector in [
+        "#PurchaseCopy",
+        'input[name="data[Purchase][copy]"]',
+    ]:
+        try:
+            fields = page.locator(selector)
+            if fields.count() == 0:
+                continue
+            fields.nth(0).set_input_files(upload_path, timeout=5000)
+            return
+        except Exception:
+            continue
+
+    # Fallback: verified attachment trigger controls on the same form.
+    for selector in [
+        ".choose-attachment-btn",
+        "#PurchaseCopyFileinput .fileinput-select",
+    ]:
+        try:
+            with page.expect_file_chooser(timeout=5000) as chooser_info:
+                page.locator(selector).first.click(timeout=5000)
+            chooser_info.value.set_files(upload_path)
+            return
+        except Exception:
+            continue
+
+    raise RuntimeError("Could not attach invoice PDF on purchase invoice form")
+
+
+def _fill_row_choice(page: Page, row_index: int, selectors: List[str], value: str) -> bool:
+    for selector in selectors:
+        try:
+            fields = page.locator(selector)
+            if fields.count() <= row_index:
+                continue
+            field = fields.nth(row_index)
+            try:
+                field.select_option(label=value, timeout=3000)
+                return True
+            except Exception:
+                pass
+            try:
+                field.fill(value, timeout=3000)
+                field.press("Enter")
+                return True
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return False
+
+
+def _set_row_tomselect_value(page: Page, row_index: int, id_prefix: str, value: str) -> bool:
+    controls = page.locator(f'input[id^="{id_prefix}"][id$="-ts-control"]')
+    try:
+        control_count = int(controls.count())
+    except Exception:
+        return False
+    if control_count <= row_index:
+        return False
+
+    control = controls.nth(row_index)
+    token = str(value or "").strip().split(" ", 1)[0]
+    numeric_token = token.isdigit()
+
+    def _selected_text() -> str:
+        try:
+            text = control.evaluate(
+                """
+                (el) => {
+                  const wrapper = el.closest('.ts-wrapper');
+                  const item = wrapper ? wrapper.querySelector('.item') : null;
+                  return (item?.textContent || '').trim();
+                }
+                """
+            )
+            return str(text or "")
+        except Exception:
+            return ""
+
+    try:
+        control.click(timeout=3000)
+        control.fill(value, timeout=3000)
+        control.press("Enter")
+        page.wait_for_timeout(150)
+    except Exception:
+        return False
+
+    selected = _selected_text().lower()
+    value_lower = value.lower()
+    token_lower = token.lower()
+    if value_lower in selected:
+        return True
+
+    # Fallback: explicitly click dropdown option by full label or code/token.
+    queries: List[str] = [value]
+    if numeric_token:
+        queries.append(token)
+
+    for query in queries:
+        if not query:
+            continue
+        for selector in [
+            f'.ts-dropdown .option:has-text("{query}")',
+            f'.ts-dropdown-content .option:has-text("{query}")',
+        ]:
+            try:
+                control.click(timeout=2000)
+                control.fill(query, timeout=2000)
+                page.wait_for_timeout(120)
+                page.locator(selector).first.click(timeout=2000)
+                page.wait_for_timeout(120)
+                selected = _selected_text().lower()
+                if value_lower in selected:
+                    return True
+                if numeric_token and token_lower and token_lower in selected:
+                    return True
+            except Exception:
+                continue
+
+    return False
+
+
+def _set_row_tomselect_by_text(
+        page: Page,
+        row_index: int,
+        selector: str,
+        target_text: str,
+        *,
+        allow_token_match: bool,
+) -> bool:
+    fields = page.locator(selector)
+    try:
+        count = int(fields.count())
+    except Exception:
+        return False
+    if count <= row_index:
+        return False
+
+    field = fields.nth(row_index)
+    target = str(target_text or "").strip().lower()
+    if not target:
+        return False
+    token = target.split(" ", 1)[0]
+
+    try:
+        result = field.evaluate(
+            """
+            (el, args) => {
+                const ts = el && el.tomselect ? el.tomselect : null;
+                if (!ts) {
+                    return { ok: false, selectedText: '' };
+                }
+
+                const target = String(args.target || '').trim().toLowerCase();
+                const token = String(args.token || '').trim().toLowerCase();
+                const allowToken = !!args.allowToken;
+
+                let chosenKey = null;
+                for (const [key, opt] of Object.entries(ts.options || {})) {
+                    const text = String(opt?.text || opt?.label || '').trim().toLowerCase();
+                    if (!text) continue;
+                    if (target && text.includes(target)) {
+                        chosenKey = key;
+                        break;
+                    }
+                    if (chosenKey === null && allowToken && token && text.includes(token)) {
+                        chosenKey = key;
+                    }
+                }
+
+                if (chosenKey === null) {
+                    return { ok: false, selectedText: '' };
+                }
+
+                ts.setValue(String(chosenKey), true);
+
+                const selectedValue = ts.getValue();
+                const valueKey = Array.isArray(selectedValue) ? selectedValue[0] : selectedValue;
+                const selected = ts.options?.[String(valueKey)] || null;
+                const selectedText = String(selected?.text || selected?.label || '').trim();
+
+                const selectedLower = selectedText.toLowerCase();
+                const ok = (target && selectedLower.includes(target))
+                    || (allowToken && token && selectedLower.includes(token));
+                return { ok, selectedText };
+            }
+            """,
+            {
+                "target": target,
+                "token": token,
+                "allowToken": allow_token_match,
+            },
+        )
+    except Exception:
+        return False
+
+    return bool(result.get("ok", False)) if isinstance(result, dict) else False
+
+
+def _set_row_select_by_text(
+    page: Page,
+    row_index: int,
+    selector: str,
+    target_text: str,
+    *,
+    allow_token_match: bool,
+) -> bool:
+    selects = page.locator(selector)
+    try:
+        count = int(selects.count())
+    except Exception:
+        return False
+    if count <= row_index:
+        return False
+
+    select = selects.nth(row_index)
+    target = str(target_text or "").strip().lower()
+    if not target:
+        return False
+    token = target.split(" ", 1)[0]
+
+    try:
+        options: List[Dict[str, str]] = select.evaluate(
+            """
+            (el) => Array.from(el.options || []).map((opt) => ({
+              value: String(opt.value || ''),
+              text: String((opt.textContent || '').trim()),
+            }))
+            """
+        )
+    except Exception:
+        return False
+
+    chosen_value = ""
+    for opt in options:
+        text = str(opt.get("text") or "").strip().lower()
+        if target in text:
+            chosen_value = str(opt.get("value") or "")
+            break
+    if not chosen_value and allow_token_match and token:
+        for opt in options:
+            text = str(opt.get("text") or "").strip().lower()
+            if token in text:
+                chosen_value = str(opt.get("value") or "")
+                break
+
+    if not chosen_value:
+        return False
+
+    try:
+        select.select_option(value=chosen_value, timeout=3000)
+    except Exception:
+        return False
+
+    try:
+        selected_text = select.evaluate(
+            """
+            (el) => {
+              const idx = el.selectedIndex;
+              if (idx < 0 || !el.options || !el.options[idx]) return '';
+              return String((el.options[idx].textContent || '').trim());
+            }
+            """
+        )
+    except Exception:
+        return False
+
+    selected = str(selected_text or "").strip().lower()
+    if target in selected:
+        return True
+    return allow_token_match and bool(token) and token in selected
+
+
+def _fill_purchase_row(page: Page, row_index: int, line: Dict[str, Any], purchase_settings: Dict[str, str] | None = None) -> None:
     description = str(line.get("description") or "")
     amount = _format_decimal(line.get("price_without_vat"))
 
@@ -273,6 +723,65 @@ def _fill_purchase_row(page: Page, row_index: int, line: Dict[str, Any]) -> None
     unit_fields.nth(row_index).fill("tk", timeout=5000)
     sum_fields.nth(row_index).fill(amount, timeout=5000)
     sum_fields.nth(row_index).press("Tab")
+
+    settings = purchase_settings or {}
+    account_code = str(settings.get("account_code") or "").strip()
+    vat_profile = str(settings.get("vat_profile") or "").strip()
+
+    if account_code:
+        account_set = _set_row_tomselect_by_text(
+            page,
+            row_index,
+            'select[name*="[PurchaseRow][expense_account_id]"]',
+            account_code,
+            allow_token_match=True,
+        )
+        if not account_set:
+            account_set = _set_row_select_by_text(
+                page,
+                row_index,
+                'select[name*="[PurchaseRow][expense_account_id]"]',
+                account_code,
+                allow_token_match=True,
+            )
+        if not account_set:
+            raise RuntimeError(f"Could not set konto '{account_code}' for purchase row {row_index}")
+
+    if vat_profile:
+        vat_set = _set_row_tomselect_by_text(
+            page,
+            row_index,
+            'input[name*="[PurchaseRow][vat_type_id]"]',
+            vat_profile,
+            allow_token_match=False,
+        )
+        if not vat_set:
+            vat_set = _set_row_select_by_text(
+                page,
+                row_index,
+                'select[name*="[PurchaseRow][vat_type_id]"]',
+                vat_profile,
+                allow_token_match=False,
+            )
+        if not vat_set:
+            raise RuntimeError(f"Could not set KM '{vat_profile}' for purchase row {row_index}")
+
+
+def _parsed_stem(parsed_name: str) -> str:
+    if parsed_name.endswith(".parsed.json"):
+        return parsed_name[: -len(".parsed.json")]
+    return Path(parsed_name).stem
+
+
+def _identify_local_pdf_path(parsed_path: Path) -> Path | None:
+    stem = _parsed_stem(parsed_path.name)
+    for candidate in [
+        parsed_path.with_name(f"{stem}.pdf"),
+        parsed_path.with_name(f"{stem}.PDF"),
+    ]:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
 
 
 def _add_purchase_row(page: Page) -> None:
@@ -382,88 +891,56 @@ def _validate_and_adjust_totals(page: Page, invoice: Dict[str, Any]) -> Dict[str
 
 def login(page: Page, base_url: str, user: str, password: str) -> None:
     page.goto(_login_url(base_url), wait_until="domcontentloaded")
-
-    filled_user = False
     try:
-        page.get_by_label("E-post").fill(user, timeout=5000)
-        filled_user = True
-    except Exception:
-        filled_user = _try_fill(page, [
-            'input[name="username"]',
-            'input[name="email"]',
-            'input[type="email"]',
-            'input[placeholder="E-post"]',
-            '#username',
-        ], user)
-    if not filled_user:
-        raise RuntimeError("Could not find username field on SimplBooks login page")
+        page.locator("#account-email-input").fill(user, timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not find username field on SimplBooks login page") from err
 
-    filled_password = False
     try:
-        page.get_by_label("Salasõna").fill(password, timeout=5000)
-        filled_password = True
-    except Exception:
-        filled_password = _try_fill(page, [
-            'input[name="password"]',
-            'input[type="password"]',
-            'input[placeholder="Salasõna"]',
-            '#password',
-        ], password)
-    if not filled_password:
-        raise RuntimeError("Could not find password field on SimplBooks login page")
+        page.locator("#account-password-input").fill(password, timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not find password field on SimplBooks login page") from err
 
-    if not _try_click(page, [
-        'button:has-text("Logi sisse")',
-        'button:has-text("Logi")',
-        'button:has-text("Login")',
-        'button:has-text("Sign in")',
-        'button[type="submit"]',
-        'input[type="submit"]',
-    ]):
-        raise RuntimeError("Could not find login submit button")
+    try:
+        page.locator("#form-submit-btn").click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not find login submit button") from err
 
-    # Dashboard/login completion signal.
     page.wait_for_load_state("networkidle", timeout=15000)
 
 
 def navigate_to_purchase_invoices(page: Page) -> None:
-    if not _try_click(page, [
-        'a:has-text("Tehingud")',
-        'button:has-text("Tehingud")',
-    ]):
-        raise RuntimeError("Could not open Tehingud menu")
+    try:
+        page.locator("#operations").click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not open Tehingud menu") from err
 
-    if not _try_click(page, [
-        'a[href$="/purchases"]',
-        'a:has-text("Ostuarved")',
-        'button:has-text("Ostuarved")',
-    ]):
-        raise RuntimeError("Could not open Ostuarved page")
+    try:
+        page.locator('a[href$="/purchases"]').first.click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not open Ostuarved page") from err
 
     page.wait_for_load_state("networkidle", timeout=15000)
 
 
-def create_invoice(page: Page, parsed: Dict[str, Any]) -> Dict[str, Any]:
+def create_invoice(page: Page, parsed: Dict[str, Any], attachment_pdf_path: Path | None = None) -> Dict[str, Any]:
     invoice = parsed.get("invoice_data") or {}
-    sender = str(invoice.get("invoice_sender") or "")
+    sender_reg_code = str(invoice.get("sender_reg_code") or "")
     invoice_number = str(invoice.get("invoice_number") or "")
     invoice_date = str(invoice.get("invoice_date") or "")
     lines = invoice.get("lines") or []
+    purchase_settings = _resolve_purchase_settings(invoice)
 
-    if not _try_click(page, [
-        'a[href$="/purchases/add"]',
-        'button:has-text("Uus ostuarve")',
-        'a:has-text("Uus ostuarve")',
-    ]):
-        raise RuntimeError("Could not open new purchase invoice form")
+    try:
+        page.locator('a[href$="/purchases/add"]').first.click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not open new purchase invoice form") from err
 
     page.wait_for_load_state("domcontentloaded", timeout=10000)
 
-    _fill_supplier(page, sender)
+    _fill_supplier(page, sender_reg_code)
     _fill(page, "#PurchaseNumber", invoice_number)
-    _fill(page, "#PurchaseCreated", invoice_date)
-    _fill(page, "#PurchaseTransactionDate", invoice_date)
-    _fill(page, "#PurchaseDue", invoice_date)
+    _fill_purchase_dates(page, invoice_date)
 
     if not isinstance(lines, list) or not lines:
         raise RuntimeError("No purchase rows available in parsed invoice")
@@ -472,12 +949,14 @@ def create_invoice(page: Page, parsed: Dict[str, Any]) -> Dict[str, Any]:
         if row_index > 0:
             _add_purchase_row(page)
             page.wait_for_timeout(300)
-        _fill_purchase_row(page, row_index, line)
+        _fill_purchase_row(page, row_index, line, purchase_settings)
+
+    if attachment_pdf_path is not None:
+        _attach_invoice_pdf(page, attachment_pdf_path)
 
     page.wait_for_timeout(300)
     totals_check = _validate_and_adjust_totals(page, invoice)
 
-    # Final save.
     _click_save_invoice(page)
 
     page.wait_for_load_state("networkidle", timeout=15000)
@@ -491,6 +970,7 @@ def process_single_invoice(
     user: str,
     password: str,
     write_result_fn: Callable[[bool, Dict[str, Any]], None],
+    attachment_pdf_bytes: bytes | None = None,
 ) -> None:
     if getattr(args, "no_submit", False) is True:
         write_result_fn(
@@ -505,14 +985,15 @@ def process_single_invoice(
         print(f"SUCCESS dry-run: {parsed_name}")
         return
 
-    if parsed_name != args.test_file:
+    test_file = str(getattr(args, "test_file", "") or "").strip()
+    if test_file and parsed_name != test_file:
         write_result_fn(
             True,
             {
                 "status": "success",
                 "mode": "placeholder-no-submit",
                 "parsed_file": parsed_name,
-                "message": "Skipped actual SimplBooks creation for non-test file.",
+                "message": "Skipped actual SimplBooks creation for non-test file filter (--test-file).",
             },
         )
         print(f"SUCCESS placeholder: {parsed_name}")
@@ -532,15 +1013,27 @@ def process_single_invoice(
 
     try:
         totals_check: Dict[str, Any] = {}
+        attachment_tmp: Path | None = None
+        if attachment_pdf_bytes:
+            with tempfile.NamedTemporaryFile(prefix="simplbooks-attachment-", suffix=".pdf", delete=False) as tmp:
+                tmp.write(attachment_pdf_bytes)
+                attachment_tmp = Path(tmp.name)
+
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=args.headless)
             context = browser.new_context()
             page = context.new_page()
             login(page, args.base_url, user, password)
             navigate_to_purchase_invoices(page)
-            totals_check = create_invoice(page, parsed)
+            totals_check = create_invoice(page, parsed, attachment_pdf_path=attachment_tmp)
             context.close()
             browser.close()
+
+        if attachment_tmp is not None:
+            try:
+                attachment_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         if totals_check.get("difference_cents", 0) > 2:
             write_result_fn(
@@ -548,9 +1041,10 @@ def process_single_invoice(
                 {
                     "status": "failed",
                     "mode": "submitted-total-mismatch",
+                    "saved_in_simplbooks": True,
                     "parsed_file": parsed_name,
                     "invoice_number": ((parsed.get("invoice_data") or {}).get("invoice_number") or ""),
-                    "message": "Invoice was saved in SimplBooks, but total mismatch exceeded 2 cents.",
+                    "message": "Invoice was submitted in SimplBooks, but total mismatch exceeded 2 cents.",
                     "totals_check": totals_check,
                 },
             )
@@ -568,6 +1062,12 @@ def process_single_invoice(
             )
             print(f"SUCCESS submitted: {parsed_name}")
     except (RuntimeError, PlaywrightTimeoutError, Exception) as err:
+        # Best-effort cleanup if temp file was created but flow failed before normal cleanup.
+        try:
+            if "attachment_tmp" in locals() and attachment_tmp is not None:
+                attachment_tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
         write_result_fn(
             False,
             {
@@ -580,36 +1080,33 @@ def process_single_invoice(
         print(f"FAILED {parsed_name}: {err}")
 
 
-def main() -> None:
-    load_dotenv()
-    args = parse_args()
-
-    user = os.getenv("SIMPLBOOKS_USER", "").strip()
-    password = os.getenv("SIMPLBOOKS_PASSWORD", "").strip()
-
-    if args.source == "local":
-        input_dir = Path(args.input_dir)
-        parsed_files = list_parsed_files(input_dir)
-        if not parsed_files:
-            print("No *.parsed.json files found.")
-            return
-
-        for parsed_path in parsed_files:
-            if has_result(parsed_path):
-                print(f"SKIP existing result: {parsed_path.name}")
-                continue
-
-            parsed = load_parsed_invoice(parsed_path)
-            process_single_invoice(
-                parsed_name=parsed_path.name,
-                parsed=parsed,
-                args=args,
-                user=user,
-                password=password,
-                write_result_fn=lambda ok, payload, p=parsed_path: write_result(p, ok=ok, payload=payload),
-            )
+def local_process(args: argparse.Namespace, user: str, password: str) -> None:
+    input_dir = Path(args.input_dir)
+    parsed_files = list_parsed_files(input_dir)
+    if not parsed_files:
+        print("No *.parsed.json files found.")
         return
 
+    for parsed_path in parsed_files:
+        if has_result(parsed_path):
+            print(f"SKIP existing result: {parsed_path.name}")
+            continue
+
+        parsed = load_parsed_invoice(parsed_path)
+        local_pdf_path = _identify_local_pdf_path(parsed_path)
+        attachment_pdf_bytes = local_pdf_path.read_bytes() if local_pdf_path is not None else None
+        process_single_invoice(
+            parsed_name=parsed_path.name,
+            parsed=parsed,
+            args=args,
+            user=user,
+            password=password,
+            write_result_fn=lambda ok, payload, p=parsed_path: write_result(p, ok=ok, payload=payload),
+            attachment_pdf_bytes=attachment_pdf_bytes,
+        )
+
+
+def remote_process(args: argparse.Namespace, user: str, password: str) -> None:
     token, drive_prefix, target_folders = _resolve_onedrive_context(args)
     jobs = list_onedrive_parsed_jobs(token, drive_prefix, target_folders)
     if not jobs:
@@ -623,6 +1120,13 @@ def main() -> None:
 
         raw = download_drive_item_content(token, drive_prefix, item_id)
         parsed = load_parsed_invoice_bytes(raw)
+        invoice_file_id = str(parsed.get("invoice_file_id") or "").strip()
+        attachment_pdf_bytes: bytes | None = None
+        if invoice_file_id:
+            try:
+                attachment_pdf_bytes = download_drive_item_content(token, drive_prefix, invoice_file_id)
+            except RuntimeError as err:
+                print(f"{process_folder}/{parsed_name}: attachment pdf download failed ({err})")
 
         process_single_invoice(
             parsed_name=parsed_name,
@@ -630,6 +1134,7 @@ def main() -> None:
             args=args,
             user=user,
             password=password,
+            attachment_pdf_bytes=attachment_pdf_bytes,
             write_result_fn=lambda ok, payload, folder=process_folder, name=parsed_name: write_onedrive_result(
                 token,
                 drive_prefix,
@@ -639,6 +1144,20 @@ def main() -> None:
                 payload,
             ),
         )
+
+
+def main() -> None:
+    load_dotenv()
+    args = parse_args()
+
+    user = os.getenv("SIMPLBOOKS_USER", "").strip()
+    password = os.getenv("SIMPLBOOKS_PASSWORD", "").strip()
+
+    if args.source == "local":
+        local_process(args, user, password)
+        return
+
+    remote_process(args, user, password)
 
 
 if __name__ == "__main__":

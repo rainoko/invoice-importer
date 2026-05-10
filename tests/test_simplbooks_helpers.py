@@ -9,6 +9,9 @@ from simplbooks_importer import (
     _format_decimal,
     _parse_decimal,
     _money_round,
+    _resolve_purchase_settings,
+    _identify_local_pdf_path,
+    _attach_invoice_pdf,
     _validate_and_adjust_totals,
     _try_fill,
     _try_click,
@@ -190,6 +193,7 @@ class TestParseArgs:
             assert args.source == "onedrive"
             assert args.auth_mode == "app"
             assert args.input_dir == "."
+            assert args.test_file is None
 
     def test_local_source(self):
         """Test local source argument"""
@@ -268,6 +272,23 @@ class TestListParsedFiles:
         """Test empty directory"""
         result = list_parsed_files(tmp_path)
         assert result == []
+
+
+class TestGuessLocalPdfPath:
+    def test_guess_local_pdf_path_found_lowercase(self, tmp_path):
+        parsed = tmp_path / "invoice.parsed.json"
+        parsed.write_text("{}", encoding="utf-8")
+        pdf = tmp_path / "invoice.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        out = _identify_local_pdf_path(parsed)
+        assert out == pdf
+
+    def test_guess_local_pdf_path_missing(self, tmp_path):
+        parsed = tmp_path / "invoice.parsed.json"
+        parsed.write_text("{}", encoding="utf-8")
+        out = _identify_local_pdf_path(parsed)
+        assert out is None
 
 
 class TestResultNames:
@@ -502,16 +523,129 @@ class TestFillSupplier:
     """Test _fill_supplier() function"""
 
     def test_fill_supplier(self):
-        """Test filling supplier field"""
+        """Test filling supplier via regcode and confirming modal."""
         page = MagicMock()
-        locator = MagicMock()
-        page.locator.return_value = locator
+        modal_open_button = MagicMock()
+        modal_open_button_first = MagicMock()
+        modal_open_button.first = modal_open_button_first
 
-        _fill_supplier(page, "Acme OÜ")
+        modal_locator = MagicMock()
+        modal_first = MagicMock()
+        modal_locator.first = modal_first
 
-        page.locator.assert_called_with("#client-select-ts-control")
-        locator.fill.assert_called_with("Acme OÜ", timeout=5000)
-        locator.press.assert_called_with("Enter")
+        reg_locator = MagicMock()
+        reg_first = MagicMock()
+        reg_locator.first = reg_first
+        reg_locator.count.return_value = 1
+
+        refresh_locator = MagicMock()
+        refresh_first = MagicMock()
+        refresh_locator.first = refresh_first
+        refresh_locator.count.return_value = 0
+
+        confirm_locator = MagicMock()
+        confirm_first = MagicMock()
+        confirm_locator.first = confirm_first
+
+        default_locator = MagicMock()
+        default_locator.first = MagicMock()
+        default_locator.count.return_value = 0
+
+        def loc_side_effect(selector):
+            if selector == 'button[data-bs-target="#client-form-offcanvas"]':
+                return modal_open_button
+            if selector == "#client-form-offcanvas":
+                return modal_locator
+            if selector == "#PurchaseClientRegNo":
+                return reg_locator
+            if selector == "#refresh-data-from-register-link":
+                return refresh_locator
+            if selector == "#client-form-offcanvas-submit":
+                return confirm_locator
+            return default_locator
+
+        page.locator.side_effect = loc_side_effect
+
+        _fill_supplier(page, "11552317")
+
+        page.locator.assert_any_call('button[data-bs-target="#client-form-offcanvas"]')
+        page.locator.assert_any_call("#client-form-offcanvas")
+        page.locator.assert_any_call("#PurchaseClientRegNo")
+        reg_first.fill.assert_called_with("11552317", timeout=3000)
+        reg_first.press.assert_called_with("Tab")
+        confirm_first.click.assert_called_once()
+
+    def test_fill_supplier_refresh_required_when_visible(self):
+        page = MagicMock()
+
+        modal_open_button = MagicMock()
+        modal_open_button.first = MagicMock()
+
+        modal_locator = MagicMock()
+        modal_locator.first = MagicMock()
+
+        reg_locator = MagicMock()
+        reg_first = MagicMock()
+        reg_locator.first = reg_first
+        reg_locator.count.return_value = 1
+
+        refresh_locator = MagicMock()
+        refresh_first = MagicMock()
+        refresh_locator.first = refresh_first
+        refresh_locator.count.return_value = 1
+        refresh_first.is_visible.return_value = True
+
+        confirm_locator = MagicMock()
+        confirm_locator.first = MagicMock()
+
+        def loc_side_effect(selector):
+            if selector == 'button[data-bs-target="#client-form-offcanvas"]':
+                return modal_open_button
+            if selector == "#client-form-offcanvas":
+                return modal_locator
+            if selector == "#PurchaseClientRegNo":
+                return reg_locator
+            if selector == "#refresh-data-from-register-link":
+                return refresh_locator
+            if selector == "#client-form-offcanvas-submit":
+                return confirm_locator
+            return MagicMock()
+
+        page.locator.side_effect = loc_side_effect
+
+        _fill_supplier(page, "11552317")
+
+        refresh_first.click.assert_called_once()
+        page.wait_for_function.assert_called_once()
+
+    def test_fill_supplier_requires_regcode(self):
+        page = MagicMock()
+        with pytest.raises(RuntimeError, match="registration code is missing"):
+            _fill_supplier(page, "")
+
+
+class TestAttachInvoicePdf:
+    def test_attach_invoice_pdf_uses_purchasecopy_input(self, tmp_path):
+        pdf = tmp_path / "invoice.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        page = MagicMock()
+        fields = MagicMock()
+        field = MagicMock()
+        fields.count.return_value = 1
+        fields.nth.return_value = field
+
+        page.locator.side_effect = lambda sel: fields if sel == "#PurchaseCopy" else MagicMock()
+
+        _attach_invoice_pdf(page, pdf)
+
+        field.set_input_files.assert_called_once()
+
+    def test_attach_invoice_pdf_raises_for_missing_file(self, tmp_path):
+        page = MagicMock()
+        missing = tmp_path / "missing.pdf"
+        with pytest.raises(RuntimeError, match="does not exist"):
+            _attach_invoice_pdf(page, missing)
 
 
 class TestFillPurchaseRow:
@@ -557,12 +691,87 @@ class TestFillPurchaseRow:
             "price_without_vat": 100.50,
         }
 
-        _fill_purchase_row(page, 0, line)
+        with patch("simplbooks_importer._set_row_tomselect_by_text", side_effect=[True, True]), \
+            patch("simplbooks_importer._set_row_select_by_text", return_value=False):
+            _fill_purchase_row(
+                page,
+                0,
+                line,
+                {
+                    "account_code": "5200",
+                    "vat_profile": "24% Eesti",
+                },
+            )
 
         name_field.fill.assert_called_with("Item 1", timeout=5000)
         quantity_field.fill.assert_called_with("1", timeout=5000)
         unit_field.fill.assert_called_with("tk", timeout=5000)
         sum_field.fill.assert_called_with("100,50", timeout=5000)
+
+        assert sum_field.press.called
+
+
+class TestResolvePurchaseSettings:
+    def test_car_expense_overrides_eu_buy(self, monkeypatch):
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_CAR_EXPENSE", "5202")
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_CAR_EXPENSE", "24% Autokulud (osaliselt ettevõtluseks kasutatav)")
+        settings = _resolve_purchase_settings(
+            {
+                "eu_buy": True,
+                "lines": [
+                    {"description": "Fuel", "is_car_expense": True},
+                    {"description": "Other", "is_car_expense": False},
+                ],
+            }
+        )
+        assert settings["account_code"] == "5202"
+        assert settings["vat_profile"] == "24% Autokulud (osaliselt ettevõtluseks kasutatav)"
+
+    def test_eu_buy_profile(self, monkeypatch):
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY", "5204")
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_EU_BUY", "0% Kauba ühendusesisene soetamine")
+        settings = _resolve_purchase_settings(
+            {
+                "eu_buy": True,
+                "lines": [{"description": "Parts", "is_car_expense": False}],
+            }
+        )
+        assert settings["account_code"] == "5204"
+        assert settings["vat_profile"] == "0% Kauba ühendusesisene soetamine"
+
+    def test_default_profile(self, monkeypatch):
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_DEFAULT", "5200")
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_DEFAULT", "24% Eesti")
+        settings = _resolve_purchase_settings(
+            {
+                "eu_buy": False,
+                "lines": [{"description": "Office", "is_car_expense": False}],
+            }
+        )
+        assert settings["account_code"] == "5200"
+        assert settings["vat_profile"] == "24% Eesti"
+
+    def test_missing_required_account_code_raises(self, monkeypatch):
+        monkeypatch.delenv("SIMPLBOOKS_ACCOUNT_CODE_DEFAULT", raising=False)
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_DEFAULT", "24% Eesti")
+        with pytest.raises(RuntimeError, match="SIMPLBOOKS_ACCOUNT_CODE_DEFAULT"):
+            _resolve_purchase_settings(
+                {
+                    "eu_buy": False,
+                    "lines": [{"description": "Office", "is_car_expense": False}],
+                }
+            )
+
+    def test_missing_required_vat_profile_raises(self, monkeypatch):
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_DEFAULT", "5200")
+        monkeypatch.delenv("SIMPLBOOKS_VAT_PROFILE_DEFAULT", raising=False)
+        with pytest.raises(RuntimeError, match="SIMPLBOOKS_VAT_PROFILE_DEFAULT"):
+            _resolve_purchase_settings(
+                {
+                    "eu_buy": False,
+                    "lines": [{"description": "Office", "is_car_expense": False}],
+                }
+            )
 
 
 class TestAddPurchaseRow:
@@ -631,30 +840,28 @@ class TestLogin:
         """Test successful login"""
         page = MagicMock()
 
-        label = MagicMock()
-        page.get_by_label.side_effect = [label, label]
+        email_locator = MagicMock()
+        pass_locator = MagicMock()
+        submit_locator = MagicMock()
+
+        def loc_side_effect(selector):
+            if selector == "#account-email-input":
+                return email_locator
+            if selector == "#account-password-input":
+                return pass_locator
+            if selector == "#form-submit-btn":
+                return submit_locator
+            return MagicMock()
+
+        page.locator.side_effect = loc_side_effect
 
         with patch("simplbooks_importer._login_url", return_value="https://secure.simplbooks.com/accounts/login"):
-            with patch("simplbooks_importer._try_fill", return_value=False):
-                login(page, "https://www.simplbooks.ee", "user@test.com", "password123")
+            login(page, "https://www.simplbooks.ee", "user@test.com", "password123")
 
         page.goto.assert_called_once()
-        assert page.get_by_label.call_count >= 1
-
-    def test_login_username_fallback(self):
-        """Test login with username field fallback"""
-        page = MagicMock()
-
-        label = MagicMock()
-        label.fill.side_effect = Exception("Not found")
-
-        page.get_by_label.side_effect = [label, label]
-
-        with patch("simplbooks_importer._login_url", return_value="https://secure.simplbooks.com/accounts/login"):
-            with patch("simplbooks_importer._try_fill", return_value=True):
-                login(page, "https://www.simplbooks.ee", "user@test.com", "password123")
-
-        page.goto.assert_called_once()
+        email_locator.fill.assert_called_once()
+        pass_locator.fill.assert_called_once()
+        submit_locator.click.assert_called_once()
 
 
 if __name__ == "__main__":

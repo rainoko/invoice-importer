@@ -705,6 +705,10 @@ def normalize_invoice_data(raw: Dict[str, Any], markdown_text: str, table_data: 
     else:
         sender_name = _snap_sender_name(sender_name, source_companies)
 
+    eu_buy = _parse_boolish(raw.get("eu_buy", False))
+    if sender_name == "Amazon Vahendus":
+        eu_buy = True
+
     lines_in = raw.get("lines", [])
     lines_out: List[Dict[str, Any]] = []
     if isinstance(lines_in, list):
@@ -726,6 +730,7 @@ def normalize_invoice_data(raw: Dict[str, Any], markdown_text: str, table_data: 
         "sender_reg_code": sender_reg_code,
         "sender_kmkr_number": sender_kmkr,
         "invoice_date": _ascii_clean(str(raw.get("invoice_date", ""))),
+        "eu_buy": eu_buy,
         "lines": lines_out,
         "total_without_vat": _snap_to_source_amount(raw.get("total_without_vat"), source_numbers),
         "total_with_vat": _snap_to_source_amount(raw.get("total_with_vat"), source_numbers),
@@ -785,7 +790,7 @@ def build_invoice_extraction_prompt(markdown_text: str, table_data: List[Dict[st
         "2) If Amazon invoice includes EE VAT number, set invoice_sender='Amazon Business EU S.a r.l'\n"
         "   and sender_kmkr_number to that EE VAT number.\n"
         "If not Amazon, identify sender name and sender registration code if possible.\n"
-        "Invoice sender can't never be Rohekood. Find real sender, if in doubt find it at footer.\n"
+        "Invoice sender must be the real issuer from the document; if unclear, prefer issuer details from footer or legal header.\n"
         "Include sender_reg_code and sender_kmkr_number in JSON.\n"
         "JSON schema:\n"
         "{\n"

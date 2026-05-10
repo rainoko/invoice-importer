@@ -571,6 +571,49 @@ class TestNormalizeInvoiceData:
         result = normalize_invoice_data(raw, markdown, table_data)
 
         assert result["invoice_sender"] == "Amazon Vahendus"
+        assert result["eu_buy"] is True
+
+    def test_non_amazon_defaults_eu_buy_false(self):
+        raw = {
+            "invoice_number": "INV001",
+            "invoice_sender": "Company OÜ",
+            "lines": [],
+            "total_without_vat": "0",
+            "total_with_vat": "0",
+        }
+
+        result = normalize_invoice_data(raw, "Regular domestic invoice", [])
+
+        assert result["eu_buy"] is False
+
+    def test_amazon_business_sets_eu_buy_false(self):
+        raw = {
+            "invoice_number": "INV001",
+            "invoice_sender": "Amazon",
+            "sender_kmkr_number": "EE123456789",
+            "lines": [],
+            "total_without_vat": "0",
+            "total_with_vat": "0",
+        }
+
+        result = normalize_invoice_data(raw, "From amazon.com invoice", [])
+
+        assert result["invoice_sender"] == "Amazon Business EU S.a r.l"
+        assert result["eu_buy"] is False
+
+    def test_eu_buy_true_for_amazon_vahendus(self):
+        raw = {
+            "invoice_number": "INV002",
+            "invoice_sender": "Amazon",
+            "lines": [],
+            "total_without_vat": "0",
+            "total_with_vat": "0",
+        }
+
+        result = normalize_invoice_data(raw, "Invoice mediated by amazon marketplace", [])
+
+        assert result["invoice_sender"] == "Amazon Vahendus"
+        assert result["eu_buy"] is True
 
     def test_normalize_lines(self):
         """Test line normalization"""

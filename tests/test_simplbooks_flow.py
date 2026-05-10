@@ -91,60 +91,104 @@ class TestLocalResultFileHelpers:
 class TestNavigationAndCreateInvoice:
     def test_login_submit_button_missing(self):
         page = MagicMock()
-        user_field = MagicMock()
-        pass_field = MagicMock()
-        page.get_by_label.side_effect = [user_field, pass_field]
+        email_locator = MagicMock()
+        pass_locator = MagicMock()
+        submit_locator = MagicMock()
+        submit_locator.click.side_effect = Exception("missing")
 
-        with patch("simplbooks_importer._try_click", return_value=False):
-            with pytest.raises(RuntimeError, match="login submit button"):
-                sbi.login(page, "https://www.simplbooks.ee", "u", "p")
+        def loc_side_effect(selector):
+            if selector == "#account-email-input":
+                return email_locator
+            if selector == "#account-password-input":
+                return pass_locator
+            if selector == "#form-submit-btn":
+                return submit_locator
+            return MagicMock()
+
+        page.locator.side_effect = loc_side_effect
+
+        with pytest.raises(RuntimeError, match="login submit button"):
+            sbi.login(page, "https://www.simplbooks.ee", "u", "p")
 
     def test_navigate_to_purchase_invoices_success(self):
         page = MagicMock()
-        with patch("simplbooks_importer._try_click", side_effect=[True, True]):
-            sbi.navigate_to_purchase_invoices(page)
+        operations = MagicMock()
+        purchases = MagicMock()
+
+        def loc_side_effect(selector):
+            if selector == "#operations":
+                return operations
+            if selector == 'a[href$="/purchases"]':
+                return purchases
+            return MagicMock()
+
+        page.locator.side_effect = loc_side_effect
+        sbi.navigate_to_purchase_invoices(page)
         page.wait_for_load_state.assert_called_with("networkidle", timeout=15000)
 
     def test_navigate_to_purchase_invoices_fail_first_menu(self):
         page = MagicMock()
-        with patch("simplbooks_importer._try_click", return_value=False):
-            with pytest.raises(RuntimeError, match="Could not open Tehingud"):
-                sbi.navigate_to_purchase_invoices(page)
+        operations = MagicMock()
+        operations.click.side_effect = Exception("missing")
+        page.locator.side_effect = lambda selector: operations if selector == "#operations" else MagicMock()
+
+        with pytest.raises(RuntimeError, match="Could not open Tehingud"):
+            sbi.navigate_to_purchase_invoices(page)
 
     def test_navigate_to_purchase_invoices_fail_second_menu(self):
         page = MagicMock()
-        with patch("simplbooks_importer._try_click", side_effect=[True, False]):
-            with pytest.raises(RuntimeError, match="Could not open Ostuarved"):
-                sbi.navigate_to_purchase_invoices(page)
+        operations = MagicMock()
+        purchases = MagicMock()
+        purchases.first.click.side_effect = Exception("missing")
+
+        def loc_side_effect(selector):
+            if selector == "#operations":
+                return operations
+            if selector == 'a[href$="/purchases"]':
+                return purchases
+            return MagicMock()
+
+        page.locator.side_effect = loc_side_effect
+
+        with pytest.raises(RuntimeError, match="Could not open Ostuarved"):
+            sbi.navigate_to_purchase_invoices(page)
 
     def test_create_invoice_requires_rows(self):
         page = MagicMock()
         parsed = {
             "invoice_data": {
                 "invoice_sender": "S",
+                "sender_reg_code": "10000001",
                 "invoice_number": "INV1",
                 "invoice_date": "2024-01-01",
                 "lines": [],
             }
         }
-        with patch("simplbooks_importer._try_click", return_value=True), \
+        with patch.object(page, "locator") as loc, \
             patch("simplbooks_importer._fill_supplier"), \
             patch("simplbooks_importer._fill"):
+            add_link = MagicMock()
+            add_link.first.click.return_value = None
+            loc.return_value = add_link
             with pytest.raises(RuntimeError, match="No purchase rows"):
                 sbi.create_invoice(page, parsed)
 
     def test_create_invoice_open_form_failure(self):
         page = MagicMock()
         parsed = {"invoice_data": {"lines": [{"description": "x", "price_without_vat": 1}]}}
-        with patch("simplbooks_importer._try_click", return_value=False):
-            with pytest.raises(RuntimeError, match="Could not open new purchase invoice form"):
-                sbi.create_invoice(page, parsed)
+        add_link = MagicMock()
+        add_link.first.click.side_effect = Exception("missing")
+        page.locator.return_value = add_link
+
+        with pytest.raises(RuntimeError, match="Could not open new purchase invoice form"):
+            sbi.create_invoice(page, parsed)
 
     def test_create_invoice_happy_path_two_rows(self):
         page = MagicMock()
         parsed = {
             "invoice_data": {
                 "invoice_sender": "Supplier",
+                "sender_reg_code": "10000002",
                 "invoice_number": "INV2",
                 "invoice_date": "2024-01-02",
                 "lines": [
@@ -153,21 +197,52 @@ class TestNavigationAndCreateInvoice:
                 ],
             }
         }
-        with patch("simplbooks_importer._try_click", return_value=True), \
+        with patch.object(page, "locator") as loc, \
             patch("simplbooks_importer._fill_supplier") as fill_supplier, \
             patch("simplbooks_importer._fill") as fill, \
             patch("simplbooks_importer._fill_purchase_row") as fill_row, \
             patch("simplbooks_importer._add_purchase_row") as add_row, \
             patch("simplbooks_importer._validate_and_adjust_totals", return_value={"difference_cents": 0}) as totals, \
             patch("simplbooks_importer._click_save_invoice"):
+            add_link = MagicMock()
+            add_link.first.click.return_value = None
+            loc.return_value = add_link
             out = sbi.create_invoice(page, parsed)
 
         assert out["difference_cents"] == 0
         fill_supplier.assert_called_once()
-        assert fill.call_count >= 4
+        assert fill.call_count >= 1
         assert fill_row.call_count == 2
         add_row.assert_called_once()
         totals.assert_called_once()
+
+    def test_create_invoice_attaches_pdf_when_path_provided(self, tmp_path):
+        page = MagicMock()
+        parsed = {
+            "invoice_data": {
+                "invoice_sender": "Supplier",
+                "sender_reg_code": "10000002",
+                "invoice_number": "INV2",
+                "invoice_date": "2024-01-02",
+                "lines": [{"description": "A", "price_without_vat": 1}],
+            }
+        }
+        pdf = tmp_path / "invoice.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        with patch.object(page, "locator") as loc, \
+            patch("simplbooks_importer._fill_supplier"), \
+            patch("simplbooks_importer._fill"), \
+            patch("simplbooks_importer._fill_purchase_row"), \
+            patch("simplbooks_importer._attach_invoice_pdf") as attach_pdf, \
+            patch("simplbooks_importer._validate_and_adjust_totals", return_value={"difference_cents": 0}), \
+            patch("simplbooks_importer._click_save_invoice"):
+            add_link = MagicMock()
+            add_link.first.click.return_value = None
+            loc.return_value = add_link
+            sbi.create_invoice(page, parsed, attachment_pdf_path=pdf)
+
+        attach_pdf.assert_called_once_with(page, pdf)
 
 
 class TestProcessSingleInvoiceAndMain:
@@ -224,6 +299,40 @@ class TestProcessSingleInvoiceAndMain:
         assert recorder and recorder[0][0] is False
         assert "Missing SIMPLBOOKS_USER" in recorder[0][1]["error"]
 
+    def test_process_single_invoice_live_when_test_file_unset(self):
+        args = MagicMock(test_file=None, headless=True, base_url="https://www.simplbooks.ee")
+        parsed = {"invoice_data": {"invoice_number": "INV-LIVE"}}
+        recorder = []
+
+        play = MagicMock()
+        browser = MagicMock()
+        context = MagicMock()
+        page = MagicMock()
+        play.chromium.launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+
+        cm = MagicMock()
+        cm.__enter__.return_value = play
+        cm.__exit__.return_value = False
+
+        with patch("simplbooks_importer.sync_playwright", return_value=cm), \
+            patch("simplbooks_importer.login"), \
+            patch("simplbooks_importer.navigate_to_purchase_invoices"), \
+            patch("simplbooks_importer.create_invoice", return_value={"difference_cents": 0}) as create_invoice:
+            sbi.process_single_invoice(
+                parsed_name="any.parsed.json",
+                parsed=parsed,
+                args=args,
+                user="u",
+                password="p",
+                write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
+            )
+
+        create_invoice.assert_called_once()
+        assert recorder and recorder[0][0] is True
+        assert recorder[0][1]["mode"] == "submitted"
+
     def test_process_single_invoice_submitted_mismatch(self):
         args = MagicMock(test_file="target.parsed.json", headless=True, base_url="https://www.simplbooks.ee")
         parsed = {"invoice_data": {"invoice_number": "INV-1"}}
@@ -256,6 +365,7 @@ class TestProcessSingleInvoiceAndMain:
 
         assert recorder and recorder[0][0] is False
         assert recorder[0][1]["mode"] == "submitted-total-mismatch"
+        assert recorder[0][1]["saved_in_simplbooks"] is True
 
     def test_process_single_invoice_success(self):
         args = MagicMock(test_file="target.parsed.json", headless=True, base_url="https://www.simplbooks.ee")
@@ -314,6 +424,7 @@ class TestProcessSingleInvoiceAndMain:
     def test_main_local_processes_unhandled_files(self, tmp_path):
         parsed_path = tmp_path / "x.parsed.json"
         parsed_path.write_text("{}", encoding="utf-8")
+        (tmp_path / "x.pdf").write_bytes(b"%PDF-1.4")
 
         args = MagicMock(
             source="local",
@@ -335,6 +446,9 @@ class TestProcessSingleInvoiceAndMain:
             sbi.main()
 
         proc.assert_called_once()
+        kwargs = proc.call_args.kwargs
+        assert kwargs["attachment_pdf_bytes"] is not None
+        assert kwargs["attachment_pdf_bytes"].startswith(b"%PDF")
 
     def test_main_local_skips_existing_result(self, tmp_path):
         parsed_path = tmp_path / "x.parsed.json"

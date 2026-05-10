@@ -1,1 +1,5 @@
 .env
+.coverage
+*.json
+*.pdf
+__pycache__
