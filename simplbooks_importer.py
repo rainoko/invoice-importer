@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 import traceback
 from datetime import datetime, timezone
@@ -253,6 +254,64 @@ def _close_calendar_popups(page: Page) -> None:
         pass
 
 
+# Month names across the locales we receive invoices in (Estonian, German,
+# English), plus common abbreviations, mapped to their month number.
+_MONTH_NAMES = {
+    # English
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+    # German
+    "januar": 1, "februar": 2, "märz": 3, "maerz": 3, "mai": 5, "juni": 6,
+    "juli": 7, "oktober": 10, "dezember": 12,
+    # Estonian
+    "jaanuar": 1, "veebruar": 2, "märts": 3, "marts": 3, "aprill": 4,
+    "juuni": 6, "juuli": 7, "oktoober": 10, "detsember": 12,
+}
+
+
+def _format_ddmmyyyy(day: int, month: int, year: int) -> str:
+    if year < 100:
+        year += 2000
+    return f"{day:02d}.{month:02d}.{year:04d}"
+
+
+def _normalize_date_value(value: str) -> str:
+    """Normalize an invoice date to SimplBooks' dd.mm.yyyy format.
+
+    Handles values already in dd.mm.yyyy, ISO yyyy-mm-dd, and "13 Juni 2026"
+    style dates with localized month names. Raises ValueError when the value is
+    present but cannot be parsed, so a bad date fails loudly instead of silently
+    clearing the date field on save.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return text
+
+    numeric = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", text)
+    if numeric:
+        day, month, year = (int(g) for g in numeric.groups())
+        return _format_ddmmyyyy(day, month, year)
+
+    iso = re.fullmatch(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
+    if iso:
+        year, month, day = (int(g) for g in iso.groups())
+        return _format_ddmmyyyy(day, month, year)
+
+    # Day + localized month name + year, in any order (e.g. "13 Juni 2026",
+    # "13. Juni 2026", "June 13, 2026").
+    tokens = re.findall(r"[^\W\d_]+|\d+", text, flags=re.UNICODE)
+    month = next((_MONTH_NAMES[t.lower()] for t in tokens if t.lower() in _MONTH_NAMES), None)
+    numbers = [int(t) for t in tokens if t.isdigit()]
+    year = next((n for n in numbers if n > 31), None)
+    day = next((n for n in numbers if 1 <= n <= 31 and n != year), None)
+    if month and day and year:
+        return _format_ddmmyyyy(day, month, year)
+
+    raise ValueError(f"Unrecognized invoice date format: {text!r}")
+
+
 def _set_date_field(page: Page, selector: str, value: str) -> None:
     wanted = str(value or "").strip()
     updated = bool(
@@ -275,7 +334,10 @@ def _set_date_field(page: Page, selector: str, value: str) -> None:
 
 
 def _fill_purchase_dates(page: Page, invoice_date: str) -> None:
-    date_value = str(invoice_date or "").strip()
+    try:
+        date_value = _normalize_date_value(invoice_date)
+    except ValueError as err:
+        raise RuntimeError(str(err)) from err
     _set_date_field(page, "#PurchaseTransactionDate", date_value)
     _close_calendar_popups(page)
     _set_date_field(page, "#PurchaseDue", date_value)
@@ -316,13 +378,50 @@ def _required_env(name: str) -> str:
     return value
 
 
-def _resolve_purchase_settings(invoice: Dict[str, Any]) -> Dict[str, str]:
-    lines = invoice.get("lines")
-    has_car_expense = False
-    if isinstance(lines, list):
-        has_car_expense = any(
-            isinstance(line, dict) and _parse_boolish(line.get("is_car_expense", False))
-            for line in lines
+def _invoice_eu_buy(invoice: Dict[str, Any]) -> bool:
+    """Whether the purchase is an intra-EU acquisition (reverse charge).
+
+    A supplier VAT number that isn't Estonian is always an EU acquisition,
+    regardless of the flag the reader stored. An EE number — or no VAT number at
+    all — falls back to the stored ``eu_buy`` flag (a domestic purchase by default).
+    """
+    kmkr = str(invoice.get("sender_kmkr_number") or "").strip().upper()
+    if kmkr:
+        return not kmkr.startswith("EE")
+    return _parse_boolish(invoice.get("eu_buy", False))
+
+
+def _resolve_purchase_settings(
+    invoice: Dict[str, Any], line: Dict[str, Any] | None = None
+) -> Dict[str, str]:
+    """Resolve the account code and VAT profile for a purchase row.
+
+    When ``line`` is given, car-expense and EU goods/service are decided per row;
+    without it (legacy/whole-invoice callers) car-expense is any-line and EU
+    defaults to goods.
+    """
+    # EU acquisitions take precedence over everything (incl. car expense): they are
+    # always a 0% reverse charge, split by row into services vs goods. Account and
+    # VAT profile are always paired.
+    if _invoice_eu_buy(invoice):
+        is_service = _parse_boolish(line.get("is_service", False)) if line is not None else False
+        if is_service:
+            return {
+                "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_EU_SERVICE"),
+                "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_EU_SERVICE"),
+            }
+        return {
+            "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY"),
+            "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_EU_BUY"),
+        }
+
+    if line is not None:
+        has_car_expense = _parse_boolish(line.get("is_car_expense", False))
+    else:
+        lines = invoice.get("lines")
+        has_car_expense = isinstance(lines, list) and any(
+            isinstance(row, dict) and _parse_boolish(row.get("is_car_expense", False))
+            for row in lines
         )
 
     if has_car_expense:
@@ -331,22 +430,304 @@ def _resolve_purchase_settings(invoice: Dict[str, Any]) -> Dict[str, str]:
             "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_CAR_EXPENSE"),
         }
 
-    if _parse_boolish(invoice.get("eu_buy", False)):
-        return {
-            "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY"),
-            "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_EU_BUY"),
-        }
-
     return {
         "account_code": _required_env("SIMPLBOOKS_ACCOUNT_CODE_DEFAULT"),
         "vat_profile": _required_env("SIMPLBOOKS_VAT_PROFILE_DEFAULT"),
     }
 
 
-def _fill_supplier(page: Page, supplier_reg_code: str) -> None:
+def _try_supplier_refresh_fallback(page: Page, reg_code: str, name_token: str) -> bool:
+    """Recover from a blocked Äriregister refresh by selecting a saved client.
+
+    When the registration code is not found in Äriregister (e.g. a foreign
+    supplier), SimplBooks shows a "Saan aru" overlay inside the supplier
+    offcanvas. This dismisses that overlay, then looks the supplier up among the
+    company's saved clients via the `/clients/autocomplete` endpoint — whose
+    response carries each client's `reg_no` even though the rendered dropdown
+    only shows names — and selects the client whose registration code matches in
+    the "Nimetus" TomSelect, populating the form. Returns True when a matching
+    saved client was selected, False otherwise.
+    """
+    wanted = str(reg_code or "").strip()
+    if not wanted:
+        return False
+
+    # Dismiss the "Saan aru" overlay inside the visible supplier offcanvas (best
+    # effort — the lookup below works via JS regardless of the overlay). Its
+    # button shares a class with a hidden inline-form button elsewhere on the
+    # page, so scope the selector to the offcanvas.
+    try:
+        page.locator("#client-form-offcanvas .client-overlay-hide-btn").first.click(timeout=2000)
+        page.wait_for_timeout(200)
+    except Exception:
+        pass
+
+    # Find the saved client by registration code and select it. Query by a name
+    # token first (precise and avoids the endpoint's result cap), then fall back
+    # to the full client list ("[ALL]") if needed.
+    try:
+        selected = page.evaluate(
+            """
+            async ({ wanted, nameToken }) => {
+                const base = location.pathname.split('/').slice(0, 2).join('/');
+                const fetchClients = async (q) => {
+                    const resp = await fetch(
+                        `${base}/clients/autocomplete?query=${encodeURIComponent(q)}`,
+                        { headers: { 'X-Requested-With': 'XMLHttpRequest' } }
+                    );
+                    if (!resp.ok) return [];
+                    const json = await resp.json();
+                    return Object.values((json && json.data) || {});
+                };
+                const matchReg = (list) =>
+                    list.find((c) => String(c.reg_no || '').trim() === wanted) || null;
+
+                let match = nameToken ? matchReg(await fetchClients(nameToken)) : null;
+                if (!match) match = matchReg(await fetchClients('[ALL]'));
+                if (!match) return null;
+
+                const sel = document.querySelector('#client-select-offcanvas');
+                const ts = sel && sel.tomselect;
+                if (!ts) return null;
+                ts.addOption({ id: match.id, text: match.name, name: match.name });
+                ts.setValue(String(match.id));
+                return { id: match.id, name: match.name };
+            }
+            """,
+            {"wanted": wanted, "nameToken": str(name_token or "").strip()},
+        )
+    except Exception:
+        return False
+
+    if not selected:
+        return False
+
+    # Confirm the selection linked a client and populated the registration code.
+    try:
+        page.wait_for_function(
+            """
+            (wantedRegCode) => {
+                const sel = document.querySelector('#client-select-offcanvas');
+                const regEl = document.querySelector('#PurchaseClientRegNo');
+                const chosen = String(sel?.value || '').trim();
+                const reg = String(regEl?.value || '').trim();
+                const wanted = String(wantedRegCode || '').trim();
+                return !!chosen && reg.includes(wanted);
+            }
+            """,
+            arg=wanted,
+            timeout=10000,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _predefined_supplier_client_id(invoice: Dict[str, Any]) -> str:
+    """Return a predefined SimplBooks client id for suppliers Äriregister can't
+    resolve, or "" if the normal registration-code flow should be used.
+
+    Amazon is not in the Estonian business register, so it maps to two saved
+    clients depending on how the purchase is taxed:
+      - eu_buy (no EE VAT)      -> 'Amazon Vahendus'     (SIMPLBOOKS_CLIENT_ID_AMAZON_VAHENDUS)
+      - has EE VAT (not eu_buy) -> 'Amazon EU S.a.r.L'   (SIMPLBOOKS_CLIENT_ID_AMAZON_EU)
+    """
+    name = str(invoice.get("invoice_sender") or "").lower()
+    is_amazon = _parse_boolish(invoice.get("is_amazon", False)) or "amazon" in name
+    if not is_amazon:
+        return ""
+    if _invoice_eu_buy(invoice):
+        return os.getenv("SIMPLBOOKS_CLIENT_ID_AMAZON_VAHENDUS", "241").strip()
+    return os.getenv("SIMPLBOOKS_CLIENT_ID_AMAZON_EU", "9").strip()
+
+
+def _open_supplier_offcanvas(page: Page) -> None:
+    try:
+        page.locator('button[data-bs-target="#client-form-offcanvas"]').first.click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not click 'Muuda tarbija andmeid'") from err
+    try:
+        page.locator("#client-form-offcanvas").first.wait_for(state="visible", timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Supplier modal did not open") from err
+    # Dismiss the "Saan aru" overlay if present (best effort).
+    try:
+        page.locator("#client-form-offcanvas .client-overlay-hide-btn").first.click(timeout=1500)
+        page.wait_for_timeout(150)
+    except Exception:
+        pass
+
+
+def _submit_supplier_offcanvas(page: Page) -> None:
+    try:
+        page.locator("#client-form-offcanvas-submit").first.click(timeout=5000)
+    except Exception as err:
+        raise RuntimeError("Could not click 'Korras' in supplier modal") from err
+    page.wait_for_timeout(500)
+
+
+def _client_search_token(name: str) -> str:
+    """A distinctive word from the client name to type into the supplier search."""
+    words = re.findall(r"[A-Za-z]{3,}", str(name or ""))
+    words.sort(key=len, reverse=True)
+    return words[0] if words else str(name or "").strip()
+
+
+def _select_existing_client_by_id(page: Page, client_id: str, query: str) -> None:
+    """Attach an existing saved client by selecting it in the Nimetus dropdown.
+
+    The Nimetus TomSelect has no onChange handler, so a programmatic setValue does
+    NOT trigger SimplBooks' client-load — the supplier fields stay empty and the
+    save silently hangs. We must drive the real interaction: type a query, then
+    click the dropdown option whose data-value is the client id.
+    """
+    cid = str(client_id or "").strip()
+    if not cid:
+        raise RuntimeError("Client id is missing")
+
+    ctrl = page.locator("#client-select-offcanvas-ts-control")
+    try:
+        ctrl.click(timeout=5000)
+        ctrl.fill(str(query or "").strip(), timeout=3000)
+    except Exception as err:
+        raise RuntimeError("Could not open supplier name dropdown") from err
+
+    option = page.locator(f'.ts-dropdown .option[data-value="{cid}"]')
+    try:
+        option.first.wait_for(state="visible", timeout=8000)
+        option.first.click(timeout=3000)
+    except Exception as err:
+        raise RuntimeError(f"Saved client {cid} not found in supplier dropdown") from err
+
+    # Wait for the selection to register; SimplBooks then loads the client's data.
+    try:
+        page.wait_for_function(
+            "(id) => document.querySelector('#client-select-offcanvas')?.tomselect?.getValue() === String(id)",
+            arg=cid,
+            timeout=8000,
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(400)
+
+
+def _select_predefined_client(page: Page, client_id: str, name_query: str = "") -> None:
+    """Attach a supplier by selecting a predefined saved client by its id
+    (Amazon, which is not in Äriregister)."""
+    cid = str(client_id or "").strip()
+    if not cid:
+        raise RuntimeError("Predefined supplier client id is missing")
+    _open_supplier_offcanvas(page)
+    _select_existing_client_by_id(page, cid, name_query or "Amazon")
+    _submit_supplier_offcanvas(page)
+
+
+def _is_foreign_supplier(invoice: Dict[str, Any]) -> bool:
+    """A non-Estonian supplier that Äriregister can't resolve."""
+    country = str(invoice.get("sender_country") or "").strip().upper()
+    return bool(country) and country != "EE"
+
+
+def _find_saved_client_id(page: Page, name: str, vat: str, reg: str) -> str:
+    """Return the id of a saved client matching this supplier's VAT/reg, else ""."""
+    want = [v for v in (str(vat or "").strip(), str(reg or "").strip()) if v]
+    if not want:
+        return ""
+    try:
+        found = page.evaluate(
+            """
+            async ({ query, want }) => {
+                const base = location.pathname.split('/').slice(0, 2).join('/');
+                const resp = await fetch(
+                    `${base}/clients/autocomplete?query=${encodeURIComponent(query || '[ALL]')}`,
+                    { headers: { 'X-Requested-With': 'XMLHttpRequest' } }
+                );
+                if (!resp.ok) return '';
+                const list = Object.values(((await resp.json()) || {}).data || {});
+                const m = list.find((c) =>
+                    want.includes(String(c.vat_no || '').trim()) ||
+                    want.includes(String(c.reg_no || '').trim())
+                );
+                return m ? String(m.id) : '';
+            }
+            """,
+            {"query": _client_search_token(name), "want": want},
+        )
+    except Exception:
+        return ""
+    return str(found or "")
+
+
+def _fill_foreign_supplier(page: Page, invoice: Dict[str, Any]) -> None:
+    """Attach a foreign supplier: reuse a matching saved client (selected via the
+    real dropdown), otherwise create a new one with minimal data.
+
+    New clients get set synchronously (the create()-backed Nimetus TomSelect, plain
+    reg/VAT/street inputs, and the ISO-code country TomSelect); existing clients
+    must be selected by clicking the dropdown option so SimplBooks loads them.
+    """
+    name = str(invoice.get("invoice_sender") or "").strip()
+    if not name:
+        raise RuntimeError("Foreign supplier name is missing")
+    reg = str(invoice.get("sender_reg_code") or "").strip()
+    vat = str(invoice.get("sender_kmkr_number") or "").strip()
+    country = str(invoice.get("sender_country") or "").strip().upper()
+    address = str(invoice.get("sender_address") or "").strip()
+
+    _open_supplier_offcanvas(page)
+
+    existing_id = _find_saved_client_id(page, name, vat, reg)
+    if existing_id:
+        _select_existing_client_by_id(page, existing_id, _client_search_token(name))
+        _submit_supplier_offcanvas(page)
+        return
+
+    outcome = page.evaluate(
+        """
+        ({ name, reg, vat, country, address }) => {
+            const nts = document.querySelector('#client-select-offcanvas')?.tomselect;
+            if (!nts) return { ok: false, reason: 'no name select' };
+            const item = nts.settings.create ? nts.settings.create.call(nts, String(name || '')) : null;
+            if (!item) return { ok: false, reason: 'name create failed' };
+            nts.addOption(item);
+            nts.setValue(item.id);
+            const setVal = (sel, v) => {
+                const el = document.querySelector(sel);
+                if (el && v != null && v !== '') {
+                    el.value = v;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            };
+            setVal('#PurchaseClientRegNo', reg);
+            setVal('#PurchaseClientVatNo', vat);
+            setVal('#PurchaseClientAddressStreet', address);
+            const cc = String(country || '').trim().toUpperCase();
+            if (cc) {
+                const cts = document.querySelector('#PurchaseClientAddressCountry')?.tomselect;
+                if (cts) { cts.addOption({ id: cc, text: cc }); cts.setValue(cc); }
+            }
+            return { ok: true };
+        }
+        """,
+        {"name": name, "reg": reg, "vat": vat, "country": country, "address": address},
+    )
+    if not outcome or not outcome.get("ok"):
+        reason = (outcome or {}).get("reason", "unknown")
+        raise RuntimeError(f"Could not attach foreign supplier '{name}' ({reason})")
+
+    _submit_supplier_offcanvas(page)
+
+
+def _fill_supplier(page: Page, supplier_reg_code: str, sender_name: str = "") -> None:
     reg_code = str(supplier_reg_code or "").strip()
     if not reg_code:
         raise RuntimeError("Supplier registration code is missing")
+
+    # First whitespace-delimited word of the supplier name, used to narrow the
+    # saved-client lookup if the Äriregister refresh fails.
+    name_parts = str(sender_name or "").strip().split()
+    name_token = name_parts[0] if name_parts else ""
 
     try:
         page.locator('button[data-bs-target="#client-form-offcanvas"]').first.click(timeout=5000)
@@ -368,6 +749,32 @@ def _fill_supplier(page: Page, supplier_reg_code: str) -> None:
     reg_field.press("Tab")
     page.wait_for_timeout(200)
 
+    def _wait_for_refresh_outcome(timeout: int) -> str:
+        # Race the two possible results of the Äriregister refresh so we react
+        # immediately: 'ok' once the form is populated, or 'error' as soon as the
+        # "Saan aru" overlay shows (rather than waiting out the full timeout).
+        handle = page.wait_for_function(
+            """
+            (wantedRegCode) => {
+                const errBtn = document.querySelector('#client-form-offcanvas .client-overlay-hide-btn');
+                if (errBtn && errBtn.offsetParent !== null) return 'error';
+                const regEl = document.querySelector('#PurchaseClientRegNo');
+                const nameEl = document.querySelector('#PurchaseClientName');
+                const sel = document.querySelector('#client-select-offcanvas');
+                const reg = String(regEl?.value || '').trim();
+                const name = String(nameEl?.value || '').trim();
+                const chosen = String(sel?.value || '').trim();
+                const wanted = String(wantedRegCode || '').trim();
+                const populated = !!reg && reg.includes(wanted) && ((!!name && name !== wanted) || !!chosen);
+                return populated ? 'ok' : false;
+            }
+            """,
+            arg=reg_code,
+            timeout=timeout,
+        )
+        return str(handle.json_value())
+
+    used_saved_client = False
     refresh_button = page.locator("#refresh-data-from-register-link")
     if refresh_button.count() > 0 and refresh_button.first.is_visible():
         try:
@@ -376,25 +783,26 @@ def _fill_supplier(page: Page, supplier_reg_code: str) -> None:
             raise RuntimeError("Could not click 'Värskenda andmeid Äriregistrist'") from err
 
         try:
-            page.wait_for_function(
-                """
-                (wantedRegCode) => {
-                    const regEl = document.querySelector('#PurchaseClientRegNo');
-                    const nameEl = document.querySelector('#PurchaseClientName');
-                    const reg = String(regEl?.value || '').trim();
-                    const name = String(nameEl?.value || '').trim();
-                    const wanted = String(wantedRegCode || '').trim();
-                    return !!reg && reg.includes(wanted) && !!name && name !== wanted;
-                }
-                """,
-                arg=reg_code,
-                timeout=15000,
-            )
-        except Exception as err:
-            raise RuntimeError("Supplier data was not refreshed and populated from Äriregister") from err
+            outcome = _wait_for_refresh_outcome(15000)
+        except Exception:
+            outcome = "error"
 
-    page.evaluate(
-        """
+        if outcome != "ok":
+            # Äriregister has no data for this code (e.g. a foreign supplier) and
+            # shows a "Saan aru" overlay. Fall back to selecting the supplier
+            # from the company's saved clients, matched by registration code.
+            if not _try_supplier_refresh_fallback(page, reg_code, name_token):
+                raise RuntimeError(
+                    "Supplier data was not refreshed and populated from Äriregister"
+                )
+            used_saved_client = True
+
+    # The Äriregister path keeps only the registration code and lets SimplBooks
+    # re-derive the rest on save. When we instead selected a saved client, that
+    # client's populated fields must be preserved, so skip the clearing step.
+    if not used_saved_client:
+        page.evaluate(
+            """
         () => {
             const root = document.querySelector('#client-form-offcanvas') || document;
             const reg = root.querySelector('#PurchaseClientRegNo');
@@ -415,7 +823,7 @@ def _fill_supplier(page: Page, supplier_reg_code: str) -> None:
             }
         }
         """
-    )
+        )
 
     try:
         page.locator("#client-form-offcanvas-submit").first.click(timeout=5000)
@@ -562,6 +970,7 @@ def _set_row_tomselect_by_text(
         target_text: str,
         *,
         allow_token_match: bool,
+        silent: bool = True,
 ) -> bool:
     fields = page.locator(selector)
     try:
@@ -607,7 +1016,10 @@ def _set_row_tomselect_by_text(
                     return { ok: false, selectedText: '' };
                 }
 
-                ts.setValue(String(chosenKey), true);
+                // silent=false fires TomSelect's change event, which updates the
+                // original element and lets the app react (e.g. recompute VAT for
+                // the chosen VAT type). Account selection stays silent.
+                ts.setValue(String(chosenKey), args.silent);
 
                 const selectedValue = ts.getValue();
                 const valueKey = Array.isArray(selectedValue) ? selectedValue[0] : selectedValue;
@@ -624,6 +1036,7 @@ def _set_row_tomselect_by_text(
                 "target": target,
                 "token": token,
                 "allowToken": allow_token_match,
+                "silent": silent,
             },
         )
     except Exception:
@@ -754,6 +1167,7 @@ def _fill_purchase_row(page: Page, row_index: int, line: Dict[str, Any], purchas
             'input[name*="[PurchaseRow][vat_type_id]"]',
             vat_profile,
             allow_token_match=False,
+            silent=False,
         )
         if not vat_set:
             vat_set = _set_row_select_by_text(
@@ -841,6 +1255,20 @@ def _click_save_invoice(page: Page) -> None:
     raise RuntimeError("Could not find save button on purchase invoice form")
 
 
+def _verify_invoice_saved(page: Page) -> None:
+    """Confirm the invoice actually persisted, rather than silently failing.
+
+    A blocked save leaves the browser on the edit form (…/purchases/add), yet the
+    code would otherwise report success. A real save redirects to …/purchases/view/<id>.
+    """
+    try:
+        page.wait_for_url("**/purchases/view/**", timeout=15000)
+    except Exception as err:
+        raise RuntimeError(
+            "Invoice was not saved in SimplBooks (still on the edit form after clicking save)"
+        ) from err
+
+
 def _read_ui_totals(page: Page) -> Dict[str, float]:
     sum_fields = page.locator('input[name*="[PurchaseRow][sum]"]')
     net_sum = 0.0
@@ -926,10 +1354,10 @@ def navigate_to_purchase_invoices(page: Page) -> None:
 def create_invoice(page: Page, parsed: Dict[str, Any], attachment_pdf_path: Path | None = None) -> Dict[str, Any]:
     invoice = parsed.get("invoice_data") or {}
     sender_reg_code = str(invoice.get("sender_reg_code") or "")
+    sender_name = str(invoice.get("invoice_sender") or "")
     invoice_number = str(invoice.get("invoice_number") or "")
     invoice_date = str(invoice.get("invoice_date") or "")
     lines = invoice.get("lines") or []
-    purchase_settings = _resolve_purchase_settings(invoice)
 
     try:
         page.locator('a[href$="/purchases/add"]').first.click(timeout=5000)
@@ -938,7 +1366,13 @@ def create_invoice(page: Page, parsed: Dict[str, Any], attachment_pdf_path: Path
 
     page.wait_for_load_state("domcontentloaded", timeout=10000)
 
-    _fill_supplier(page, sender_reg_code)
+    predefined_client_id = _predefined_supplier_client_id(invoice)
+    if predefined_client_id:
+        _select_predefined_client(page, predefined_client_id, "Amazon")
+    elif _is_foreign_supplier(invoice):
+        _fill_foreign_supplier(page, invoice)
+    else:
+        _fill_supplier(page, sender_reg_code, sender_name)
     _fill(page, "#PurchaseNumber", invoice_number)
     _fill_purchase_dates(page, invoice_date)
 
@@ -949,7 +1383,8 @@ def create_invoice(page: Page, parsed: Dict[str, Any], attachment_pdf_path: Path
         if row_index > 0:
             _add_purchase_row(page)
             page.wait_for_timeout(300)
-        _fill_purchase_row(page, row_index, line, purchase_settings)
+        row_settings = _resolve_purchase_settings(invoice, line)
+        _fill_purchase_row(page, row_index, line, row_settings)
 
     if attachment_pdf_path is not None:
         _attach_invoice_pdf(page, attachment_pdf_path)
@@ -958,8 +1393,7 @@ def create_invoice(page: Page, parsed: Dict[str, Any], attachment_pdf_path: Path
     totals_check = _validate_and_adjust_totals(page, invoice)
 
     _click_save_invoice(page)
-
-    page.wait_for_load_state("networkidle", timeout=15000)
+    _verify_invoice_saved(page)
     return totals_check
 
 

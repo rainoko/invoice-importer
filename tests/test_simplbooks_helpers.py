@@ -17,6 +17,7 @@ from simplbooks_importer import (
     _try_click,
     _read_ui_totals,
     _fill_supplier,
+    _normalize_date_value,
     _fill_purchase_row,
     _add_purchase_row,
     _click_save_invoice,
@@ -26,6 +27,44 @@ from simplbooks_importer import (
     result_names,
     _login_url,
 )
+
+
+class TestNormalizeDateValue:
+    """Test _normalize_date_value() function"""
+
+    def test_already_ddmmyyyy(self):
+        assert _normalize_date_value("16.04.2026") == "16.04.2026"
+
+    def test_pads_single_digits(self):
+        assert _normalize_date_value("5.4.2026") == "05.04.2026"
+
+    def test_iso_format(self):
+        assert _normalize_date_value("2026-04-16") == "16.04.2026"
+
+    def test_slash_format(self):
+        assert _normalize_date_value("16/04/2026") == "16.04.2026"
+
+    def test_german_month_name(self):
+        assert _normalize_date_value("13 Juni 2026") == "13.06.2026"
+
+    def test_german_month_name_with_dot(self):
+        assert _normalize_date_value("13. Juni 2026") == "13.06.2026"
+
+    def test_english_month_name(self):
+        assert _normalize_date_value("June 13, 2026") == "13.06.2026"
+
+    def test_estonian_month_name(self):
+        assert _normalize_date_value("13 juuni 2026") == "13.06.2026"
+
+    def test_two_digit_year(self):
+        assert _normalize_date_value("16.04.26") == "16.04.2026"
+
+    def test_empty_passthrough(self):
+        assert _normalize_date_value("") == ""
+
+    def test_unrecognized_raises(self):
+        with pytest.raises(ValueError):
+            _normalize_date_value("not a date")
 
 
 class TestFormatDecimal:
@@ -612,6 +651,7 @@ class TestFillSupplier:
             return MagicMock()
 
         page.locator.side_effect = loc_side_effect
+        page.wait_for_function.return_value.json_value.return_value = "ok"
 
         _fill_supplier(page, "11552317")
 
@@ -712,32 +752,47 @@ class TestFillPurchaseRow:
 
 
 class TestResolvePurchaseSettings:
-    def test_car_expense_overrides_eu_buy(self, monkeypatch):
-        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_CAR_EXPENSE", "5202")
-        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_CAR_EXPENSE", "24% Autokulud (osaliselt ettevõtluseks kasutatav)")
-        settings = _resolve_purchase_settings(
-            {
-                "eu_buy": True,
-                "lines": [
-                    {"description": "Fuel", "is_car_expense": True},
-                    {"description": "Other", "is_car_expense": False},
-                ],
-            }
-        )
-        assert settings["account_code"] == "5202"
-        assert settings["vat_profile"] == "24% Autokulud (osaliselt ettevõtluseks kasutatav)"
-
-    def test_eu_buy_profile(self, monkeypatch):
+    def test_eu_buy_overrides_car_expense(self, monkeypatch):
+        # EU acquisitions are always 5204/5205 at 0% reverse charge — a car-expense
+        # line on an EU invoice must NOT fall back to the car account.
         monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY", "5204")
         monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_EU_BUY", "0% Kauba ühendusesisene soetamine")
         settings = _resolve_purchase_settings(
-            {
-                "eu_buy": True,
-                "lines": [{"description": "Parts", "is_car_expense": False}],
-            }
+            {"eu_buy": True, "lines": [{"description": "Fuel", "is_car_expense": True}]},
+            {"description": "Fuel", "is_car_expense": True, "is_service": False},
         )
         assert settings["account_code"] == "5204"
         assert settings["vat_profile"] == "0% Kauba ühendusesisene soetamine"
+
+    def test_eu_buy_via_non_ee_vat(self, monkeypatch):
+        # A non-EE supplier VAT is an EU acquisition even if eu_buy wasn't flagged.
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY", "5204")
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_EU_BUY", "0% Kauba ühendusesisene soetamine")
+        settings = _resolve_purchase_settings(
+            {"eu_buy": False, "sender_kmkr_number": "EU442008451", "lines": []},
+            {"description": "Parts", "is_service": False},
+        )
+        assert settings["account_code"] == "5204"
+
+    def test_eu_goods_row(self, monkeypatch):
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_EU_BUY", "5204")
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_EU_BUY", "0% Kauba ühendusesisene soetamine")
+        settings = _resolve_purchase_settings(
+            {"sender_kmkr_number": "DE815526071", "lines": []},
+            {"description": "LEGO", "is_service": False},
+        )
+        assert settings["account_code"] == "5204"
+        assert settings["vat_profile"] == "0% Kauba ühendusesisene soetamine"
+
+    def test_eu_service_row(self, monkeypatch):
+        monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_EU_SERVICE", "5205")
+        monkeypatch.setenv("SIMPLBOOKS_VAT_PROFILE_EU_SERVICE", "0% Teenuste ühendusesisene soetamine")
+        settings = _resolve_purchase_settings(
+            {"sender_kmkr_number": "EU442008451", "lines": []},
+            {"description": "Domain", "is_service": True},
+        )
+        assert settings["account_code"] == "5205"
+        assert settings["vat_profile"] == "0% Teenuste ühendusesisene soetamine"
 
     def test_default_profile(self, monkeypatch):
         monkeypatch.setenv("SIMPLBOOKS_ACCOUNT_CODE_DEFAULT", "5200")

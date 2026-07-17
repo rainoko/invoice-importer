@@ -15,7 +15,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from decimal import Decimal, InvalidOperation
@@ -700,6 +702,7 @@ def normalize_invoice_data(raw: Dict[str, Any], markdown_text: str, table_data: 
     if is_amazon:
         if sender_kmkr.startswith("EE"):
             sender_name = "Amazon Business EU S.a r.l"
+            sender_reg_code = "60627889"
         else:
             sender_name = "Amazon Vahendus"
     else:
@@ -739,6 +742,80 @@ def normalize_invoice_data(raw: Dict[str, Any], markdown_text: str, table_data: 
     return normalized
 
 
+# Shared extraction rules used by both the markdown-based prompt and the
+# Claude CLI PDF prompt. Only the input preamble/tail differs between them.
+_INVOICE_EXTRACTION_RULES = (
+    "Line extraction rules (very important):\n"
+    "1) Extract invoice lines only from product/service rows (e.g. rows containing item name/code/unit/qty/amount).\n"
+    "2) NEVER use amounts from VAT/summary/footer rows as line prices.\n"
+    "3) Exclude any row/block text containing these keywords from line extraction:\n"
+    "   'kaibemaks', 'vat', 'km-ga', 'kmga', 'kokku', 'total', 'tasuda', 'summa kokku', 'kmkr', 'registrikood'.\n"
+    "4) If one block contains both line rows and totals, split logically and keep only line-row amounts for lines.\n"
+    "5) In table-like rows where multiple numbers appear (e.g. unit price, line sum, qty), use the row line-sum amount for price_without_vat.\n"
+    "6) Keep lines concise and relevant. Do not include address/header/footer rows as invoice lines.\n"
+    "7) Return at most 15 line objects in JSON lines array.\n"
+    "8) Some rows are descriptive only. Do not create invoice lines from descriptive text rows.\n"
+    "9) If a candidate line amount equals total_without_vat or total_with_vat, treat it as subtotal/total context, not a real invoice line.\n"
+    "10) For each line, set is_car_expense=true when the line clearly relates to vehicle usage/maintenance/operations.\n"
+    "    Examples: fuel, charging, parking, toll/road fee, car wash, maintenance/repair, tires, oil, spare parts, inspection, leasing/rent, mileage/transport.\n"
+    "    Otherwise set is_car_expense=false.\n"
+    "11) For each line, set is_service=true when the line is a service rather than physical goods.\n"
+    "    Services: software/SaaS subscriptions, hosting, domains, website/platform fees, advertising,\n"
+    "    licenses, professional/consulting fees, telecom. Physical goods: is_service=false.\n"
+    "    Shipping/handling charged alongside goods follows the goods (is_service=false).\n"
+    "\n"
+    "Totals rules:\n"
+    "1) Extract totals from dedicated summary rows, not from item description text.\n"
+    "2) Build an internal candidate map from summary labels first, then select values by label meaning (not by largest/smallest number).\n"
+    "3) Map labels by meaning:\n"
+    "   - net/subtotal/before-tax/excl-tax (e.g. subtotal, net total, amount excl tax) -> total_without_vat\n"
+    "   - tax/VAT/GST/sales tax amount (often with percent like 20%, 24%) -> tax_amount\n"
+    "   - gross/grand total/payable/amount due/incl-tax -> total_with_vat\n"
+    "4) If both total_with_vat and tax_amount are present, and net subtotal is missing, set total_without_vat = total_with_vat - tax_amount.\n"
+    "5) If net subtotal and tax_amount are present but gross total is missing, set total_with_vat = total_without_vat + tax_amount.\n"
+    "6) If tax amount is zero-rated, total_without_vat may equal total_with_vat.\n"
+    "7) Never use random numbers from coordinates/headers/IDs as totals.\n"
+    "8) Do not use payment rows (payments received, paid amount, outstanding balance) as invoice totals unless explicitly labeled as grand total/payable.\n"
+    "\n"
+    "Validation rules:\n"
+    "1) After extraction, verify that total_with_vat >= total_without_vat when tax is positive.\n"
+    "2) If VAT/tax amount exists, verify approximately: total_without_vat + tax_amount ~= total_with_vat.\n"
+    "3) If totals look inconsistent, re-check summary/tax rows before finalizing JSON.\n"
+    "4) Verify no invoice line has the same amount as total_without_vat or total_with_vat unless source clearly shows it as a true product/service row.\n"
+    "5) For single-line invoices, line amount may equal net subtotal; this is valid and should not force totals to 0.\n"
+    "\n"
+    "All price fields MUST be JSON numbers only (no currency symbols, no unicode signs, no text).\n"
+    "Amazon rules:\n"
+    "1) If invoice is from Amazon or mediated by Amazon, set invoice_sender='Amazon Vahendus'.\n"
+    "2) If Amazon invoice includes EE VAT number, set invoice_sender='Amazon Business EU S.a r.l'\n"
+    "   and sender_kmkr_number to that EE VAT number.\n"
+    "If not Amazon, identify sender name and sender registration code if possible.\n"
+    "Invoice sender must be the real issuer from the document; if unclear, prefer issuer details from footer or legal header.\n"
+    "Include sender_reg_code and sender_kmkr_number in JSON.\n"
+    "JSON schema:\n"
+    "{\n"
+    '  "invoice_number": "string",\n'
+    '  "invoice_sender": "string",\n'
+    '  "sender_reg_code": "string",\n'
+    '  "sender_kmkr_number": "string",\n'
+    '  "invoice_date": "string",\n'
+    '  "lines": [\n'
+    "    {\n"
+    '      "description": "string",\n'
+    '      "price_without_vat": 0.0,\n'
+    '      "price_with_vat": 0.0,\n'
+    '      "is_car_expense": false,\n'
+    '      "is_service": false\n'
+    "    }\n"
+    "  ],\n"
+    '  "total_without_vat": 0.0,\n'
+    '  "total_with_vat": 0.0\n'
+    "}\n"
+    "If a value is missing, use empty string.\n\n"
+    "Return compact JSON only; no markdown, no code fences, no explanations.\n\n"
+)
+
+
 def build_invoice_extraction_prompt(markdown_text: str, table_data: List[Dict[str, Any]]) -> str:
     tables_json = json.dumps(table_data, ensure_ascii=True)
     return (
@@ -749,73 +826,34 @@ def build_invoice_extraction_prompt(markdown_text: str, table_data: List[Dict[st
         "Copy exact numeric values as they appear in markdown/tables whenever present.\n"
         "Use comma or dot decimals from source, but output as JSON numbers.\n"
         "\n"
-        "Line extraction rules (very important):\n"
-        "1) Extract invoice lines only from product/service rows (e.g. rows containing item name/code/unit/qty/amount).\n"
-        "2) NEVER use amounts from VAT/summary/footer rows as line prices.\n"
-        "3) Exclude any row/block text containing these keywords from line extraction:\n"
-        "   'kaibemaks', 'vat', 'km-ga', 'kmga', 'kokku', 'total', 'tasuda', 'summa kokku', 'kmkr', 'registrikood'.\n"
-        "4) If one block contains both line rows and totals, split logically and keep only line-row amounts for lines.\n"
-        "5) In table-like rows where multiple numbers appear (e.g. unit price, line sum, qty), use the row line-sum amount for price_without_vat.\n"
-        "6) Keep lines concise and relevant. Do not include address/header/footer rows as invoice lines.\n"
-        "7) Return at most 15 line objects in JSON lines array.\n"
-        "8) Some rows are descriptive only. Do not create invoice lines from descriptive text rows.\n"
-        "9) If a candidate line amount equals total_without_vat or total_with_vat, treat it as subtotal/total context, not a real invoice line.\n"
-        "10) For each line, set is_car_expense=true when the line clearly relates to vehicle usage/maintenance/operations.\n"
-        "    Examples: fuel, charging, parking, toll/road fee, car wash, maintenance/repair, tires, oil, spare parts, inspection, leasing/rent, mileage/transport.\n"
-        "    Otherwise set is_car_expense=false.\n"
+        + _INVOICE_EXTRACTION_RULES
+        + "Structured tables extracted from PDF (JSON):\n"
+        + f"{tables_json}\n\n"
+        + "Markdown:\n"
+        + markdown_text
+    )
+
+
+def build_invoice_cli_prompt() -> str:
+    return (
+        "You are extracting invoice data from a PDF file. Return STRICT JSON only (no text outside JSON).\n"
+        "Read the invoice PDF directly (both the text layer and the page layout/images).\n"
+        "Copy exact numeric values as they appear in the document.\n"
+        "Use comma or dot decimals from source, but output as JSON numbers.\n"
         "\n"
-        "Totals rules:\n"
-        "1) Extract totals from dedicated summary rows, not from item description text.\n"
-        "2) Build an internal candidate map from summary labels first, then select values by label meaning (not by largest/smallest number).\n"
-        "3) Map labels by meaning:\n"
-        "   - net/subtotal/before-tax/excl-tax (e.g. subtotal, net total, amount excl tax) -> total_without_vat\n"
-        "   - tax/VAT/GST/sales tax amount (often with percent like 20%, 24%) -> tax_amount\n"
-        "   - gross/grand total/payable/amount due/incl-tax -> total_with_vat\n"
-        "4) If both total_with_vat and tax_amount are present, and net subtotal is missing, set total_without_vat = total_with_vat - tax_amount.\n"
-        "5) If net subtotal and tax_amount are present but gross total is missing, set total_with_vat = total_without_vat + tax_amount.\n"
-        "6) If tax amount is zero-rated, total_without_vat may equal total_with_vat.\n"
-        "7) Never use random numbers from coordinates/headers/IDs as totals.\n"
-        "8) Do not use payment rows (payments received, paid amount, outstanding balance) as invoice totals unless explicitly labeled as grand total/payable.\n"
-        "\n"
-        "Validation rules:\n"
-        "1) After extraction, verify that total_with_vat >= total_without_vat when tax is positive.\n"
-        "2) If VAT/tax amount exists, verify approximately: total_without_vat + tax_amount ~= total_with_vat.\n"
-        "3) If totals look inconsistent, re-check summary/tax rows before finalizing JSON.\n"
-        "4) Verify no invoice line has the same amount as total_without_vat or total_with_vat unless source clearly shows it as a true product/service row.\n"
-        "5) For single-line invoices, line amount may equal net subtotal; this is valid and should not force totals to 0.\n"
-        "\n"
-        "All price fields MUST be JSON numbers only (no currency symbols, no unicode signs, no text).\n"
-        "Amazon rules:\n"
-        "1) If invoice is from Amazon or mediated by Amazon, set invoice_sender='Amazon Vahendus'.\n"
-        "2) If Amazon invoice includes EE VAT number, set invoice_sender='Amazon Business EU S.a r.l'\n"
-        "   and sender_kmkr_number to that EE VAT number.\n"
-        "If not Amazon, identify sender name and sender registration code if possible.\n"
-        "Invoice sender must be the real issuer from the document; if unclear, prefer issuer details from footer or legal header.\n"
-        "Include sender_reg_code and sender_kmkr_number in JSON.\n"
-        "JSON schema:\n"
-        "{\n"
-        '  "invoice_number": "string",\n'
-        '  "invoice_sender": "string",\n'
-        '  "sender_reg_code": "string",\n'
-        '  "sender_kmkr_number": "string",\n'
-        '  "invoice_date": "string",\n'
-        '  "lines": [\n'
-        "    {\n"
-        '      "description": "string",\n'
-        '      "price_without_vat": 0.0,\n'
-        '      "price_with_vat": 0.0,\n'
-        '      "is_car_expense": false\n'
-        "    }\n"
-        "  ],\n"
-        '  "total_without_vat": 0.0,\n'
-        '  "total_with_vat": 0.0\n'
-        "}\n"
-        "If a value is missing, use empty string.\n\n"
-        "Return compact JSON only; no markdown, no code fences, no explanations.\n\n"
-        "Structured tables extracted from PDF (JSON):\n"
-        f"{tables_json}\n\n"
-        "Markdown:\n"
-        f"{markdown_text}"
+        + _INVOICE_EXTRACTION_RULES
+        + "Also include these extra fields in the JSON:\n"
+        "- \"eu_buy\" (boolean): true when this is an intra-EU acquisition (supplier in\n"
+        "  another EU country, reverse-charge / 0% VAT); otherwise false.\n"
+        "- \"amazon_mediated\" (boolean): true if this purchase was made through the\n"
+        "  Amazon marketplace or the invoice is issued/mediated by Amazon (Amazon\n"
+        "  branding, an Amazon order number, an amazon.* domain, or 'sold by ... on\n"
+        "  Amazon'), EVEN IF the actual seller/issuer is a third-party company.\n"
+        "  Otherwise false.\n"
+        "- \"sender_country\" (string): the supplier's country as an ISO 3166-1 alpha-2\n"
+        "  code (e.g. EE, FR, DE, LU) if determinable, else empty string.\n"
+        "- \"sender_address\" (string): the supplier's postal address as printed, else\n"
+        "  empty string.\n"
     )
 
 
@@ -1091,6 +1129,98 @@ def extract_invoice_data_with_github_models(
     )
 
 
+def extract_invoice_data_with_claude_cli(
+    pdf_bytes: bytes,
+    claude_model: str,
+) -> tuple[Dict[str, Any] | None, str]:
+    """Extract invoice data by driving the Claude Code CLI in headless mode.
+
+    Writes the PDF to a temp file and asks `claude -p` to read it (via its Read
+    tool, which handles PDFs natively) and return strict JSON. No PDF text/OCR
+    pre-processing is needed on our side.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    try:
+        tmp.write(pdf_bytes)
+        tmp.close()
+        prompt = (
+            build_invoice_cli_prompt()
+            + "\nRead the PDF at the path below and return ONLY the JSON object, nothing else.\n"
+            + f"PDF path: {tmp.name}"
+        )
+        cmd = [
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            "--allowedTools",
+            "Read",
+        ]
+        if claude_model:
+            cmd += ["--model", claude_model]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except FileNotFoundError:
+            return None, "claude_cli_not_found"
+        except subprocess.TimeoutExpired:
+            return None, "claude_cli_timeout"
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip().replace("\n", " ")
+        return None, f"claude_cli_exit_{proc.returncode}: {stderr[:180]}"
+
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None, "claude_cli_non_json_envelope"
+
+    if envelope.get("is_error"):
+        return None, f"claude_cli_error: {str(envelope.get('result', ''))[:180]}"
+
+    raw = str(envelope.get("result", ""))
+    parsed = parse_json_from_ollama_response(raw)
+    if not parsed:
+        return None, "json_parse_failed"
+    # Trust Claude's structured output directly — no source-snapping/normalization.
+    # It reads the PDF natively, and the SimplBooks importer coerces types on its side.
+    parsed = _apply_claude_supplier_rules(parsed)
+    if not is_complete_invoice_data(parsed):
+        return None, "schema_incomplete"
+    return parsed, ""
+
+
+def _apply_claude_supplier_rules(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic supplier canonicalization for the Claude CLI path.
+
+    Restores the Amazon two-way rule the markdown pipeline applied in
+    normalize_invoice_data: an Amazon purchase carrying an EE VAT number is a
+    domestic-VAT purchase (not an EU acquisition), while any other Amazon
+    purchase is an intra-EU acquisition. The SimplBooks importer routes these two
+    cases to predefined saved clients. Non-Amazon invoices keep the model's own
+    eu_buy value.
+    """
+    name = str(parsed.get("invoice_sender") or "")
+    kmkr = str(parsed.get("sender_kmkr_number") or "").strip().upper()
+    # Amazon marketplace purchases route to predefined SimplBooks clients even when
+    # the invoice issuer is a third-party seller, so trust the model's
+    # amazon_mediated flag (detected from the whole invoice) over the sender name.
+    is_amazon = _parse_boolish(parsed.get("amazon_mediated", False)) or "amazon" in name.lower()
+    parsed["is_amazon"] = is_amazon
+    # A supplier VAT number that isn't Estonian always means an intra-EU
+    # acquisition (reverse charge). An EE number — or no VAT number — is domestic.
+    if kmkr:
+        parsed["eu_buy"] = not kmkr.startswith("EE")
+    else:
+        parsed.setdefault("eu_buy", False)
+    return parsed
+
+
 def _load_table_data_for_markdown(
     token: str,
     drive_prefix: str,
@@ -1148,6 +1278,7 @@ def process_month_folder(
     github_models_model: str,
     progress: LiveProgress,
     initial_md_count: int,
+    claude_model: str = "",
 ) -> Dict[str, int]:
     processed = 0
     skipped = 0
@@ -1191,8 +1322,52 @@ def process_month_folder(
             progress.advance(f"{folder_path} pdf skip missing-id")
             continue
 
-        markdown_name = f"{name.rsplit('.', 1)[0]}.md"
-        tables_name = f"{name.rsplit('.', 1)[0]}.tables.json"
+        stem = name.rsplit(".", 1)[0]
+
+        # Claude CLI path: read the PDF directly and write the parsed marker in a
+        # single step, skipping markdown/OCR extraction entirely.
+        if llm_provider == "claude_cli":
+            processed_marker = f"{stem}.parsed.json"
+            if processed_marker in process_names:
+                markdown_skipped_existing += 1
+                progress.advance(f"{folder_path} pdf skip existing-json")
+                continue
+
+            pdf_bytes = download_drive_item_content(token, drive_prefix, item_id)
+            invoice_data, parse_reason = extract_invoice_data_with_claude_cli(pdf_bytes, claude_model)
+            if not invoice_data:
+                markdown_failed += 1
+                print(f"{folder_path}: claude cli parse failed for {name} ({parse_reason})")
+                progress.advance(f"{folder_path} pdf fail claude-cli")
+                continue
+
+            marker_content = json.dumps(
+                {
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                    "source_markdown": "",
+                    "invoice_file_id": pdf_id_by_stem.get(stem, str(item_id)),
+                    "markdown_file_id": "",
+                    "tables_file_name": "",
+                    "invoice_data": invoice_data,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            upload_text_to_folder(
+                token=token,
+                drive_prefix=drive_prefix,
+                folder_path=process_folder,
+                file_name=processed_marker,
+                content=marker_content,
+                content_type="application/json; charset=utf-8",
+            )
+            process_names.add(processed_marker)
+            markdown_processed += 1
+            progress.advance(f"{folder_path} pdf parsed claude-cli")
+            continue
+
+        markdown_name = f"{stem}.md"
+        tables_name = f"{stem}.tables.json"
         if markdown_name in process_names:
             skipped_existing += 1
             progress.advance(f"{folder_path} pdf skip existing-md")
@@ -1350,6 +1525,7 @@ def main() -> None:
     cerebras_model = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-instruct-2507")
     openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
     github_models_model = os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4.1-mini")
+    claude_model = os.getenv("CLAUDE_MODEL", "").strip()
 
     month_folders = [x.rsplit("/", 1)[-1] for x in target_folders]
     print(f"Processing folders: {month_folders[0]}, {month_folders[1]}")
@@ -1412,6 +1588,7 @@ def main() -> None:
                 github_models_model=github_models_model,
                 progress=progress,
                 initial_md_count=int(scan.get("md_count", 0)),
+                claude_model=claude_model,
             )
             total_processed += result["processed"]
             total_skipped += result["skipped"]
