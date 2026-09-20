@@ -7,9 +7,16 @@ Behavior:
 - If --test-file is provided, only that parsed invoice will be submitted.
 - Optional no-submit mode marks all parsed invoices as success without opening SimplBooks.
 
+Logs into SimplBooks with email/password (SimplBooks also has a "Sign in
+with Google" button, but Google's bot detection blocks that flow for an
+automation-launched browser, so it isn't used here). One login is reused for
+every invoice in a run, and persisted to disk (SIMPLBOOKS_AUTH_STATE_PATH)
+so a still-valid session skips logging in again on the next run.
+
 Environment variables:
 - SIMPLBOOKS_USER
 - SIMPLBOOKS_PASSWORD
+- SIMPLBOOKS_AUTH_STATE_PATH (optional; defaults to simplbooks_auth_state.json)
 """
 
 from __future__ import annotations
@@ -839,8 +846,12 @@ def _attach_invoice_pdf(page: Page, pdf_path: Path) -> None:
 
     upload_path = str(pdf_path)
 
-    # Verified live control on SimplBooks purchase form.
+    # SimplBooks' purchase invoice form now uses a FilePond widget for
+    # attachments; its hidden file input can still be targeted directly via
+    # set_input_files without going through the (pointer-event-blocked) drop
+    # zone. #PurchaseCopy is kept as a fallback in case SimplBooks reverts.
     for selector in [
+        'input.filepond--browser[name="data[Purchase][attachments][]"]',
         "#PurchaseCopy",
         'input[name="data[Purchase][copy]"]',
     ]:
@@ -849,19 +860,6 @@ def _attach_invoice_pdf(page: Page, pdf_path: Path) -> None:
             if fields.count() == 0:
                 continue
             fields.nth(0).set_input_files(upload_path, timeout=5000)
-            return
-        except Exception:
-            continue
-
-    # Fallback: verified attachment trigger controls on the same form.
-    for selector in [
-        ".choose-attachment-btn",
-        "#PurchaseCopyFileinput .fileinput-select",
-    ]:
-        try:
-            with page.expect_file_chooser(timeout=5000) as chooser_info:
-                page.locator(selector).first.click(timeout=5000)
-            chooser_info.value.set_files(upload_path)
             return
         except Exception:
             continue
@@ -1317,8 +1315,25 @@ def _validate_and_adjust_totals(page: Page, invoice: Dict[str, Any]) -> Dict[str
     }
 
 
+def _is_logged_out(page: Page) -> bool:
+    return "secure.simplbooks.com" in page.url and "/accounts/login" in page.url
+
+
 def login(page: Page, base_url: str, user: str, password: str) -> None:
+    """Log into SimplBooks with email/password.
+
+    SimplBooks also offers a "Sign in with Google" button, but Google's bot
+    detection intermittently refuses to render or complete that flow for an
+    automation-launched browser (confirmed live: it eventually blocks with
+    "This browser or app may not be secure"), so email/password is the
+    reliable scripted path. ``_BrowserSession`` still reuses one login across
+    a whole run instead of per invoice.
+    """
     page.goto(_login_url(base_url), wait_until="domcontentloaded")
+
+    if not _is_logged_out(page):
+        return
+
     try:
         page.locator("#account-email-input").fill(user, timeout=5000)
     except Exception as err:
@@ -1397,12 +1412,67 @@ def create_invoice(page: Page, parsed: Dict[str, Any], attachment_pdf_path: Path
     return totals_check
 
 
+DEFAULT_AUTH_STATE_PATH = "simplbooks_auth_state.json"
+
+
+def _auth_state_path() -> Path:
+    return Path(os.getenv("SIMPLBOOKS_AUTH_STATE_PATH", DEFAULT_AUTH_STATE_PATH))
+
+
+class _BrowserSession:
+    """Lazily launches one browser/context for a whole run and persists the
+    login to disk (Playwright storage state), so a fresh login only happens
+    once per run (not per invoice) and is skipped entirely on later runs
+    while the saved session is still valid."""
+
+    def __init__(self, base_url: str, user: str, password: str, headless: bool, auth_state_path: Path):
+        self._base_url = base_url
+        self._user = user
+        self._password = password
+        self._headless = headless
+        self._auth_state_path = auth_state_path
+        self._playwright = None
+        self._browser = None
+        self._context = None
+
+    def context(self):
+        if self._context is not None:
+            return self._context
+
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+        if self._browser is None:
+            self._browser = self._playwright.chromium.launch(headless=self._headless)
+
+        storage_state = str(self._auth_state_path) if self._auth_state_path.exists() else None
+        context = self._browser.new_context(storage_state=storage_state)
+        login_page = context.new_page()
+        try:
+            login(login_page, self._base_url, self._user, self._password)
+        except Exception:
+            login_page.close()
+            context.close()
+            raise
+        context.storage_state(path=str(self._auth_state_path))
+        login_page.close()
+
+        self._context = context
+        return self._context
+
+    def close(self) -> None:
+        if self._context is not None:
+            self._context.close()
+        if self._browser is not None:
+            self._browser.close()
+        if self._playwright is not None:
+            self._playwright.stop()
+
+
 def process_single_invoice(
     parsed_name: str,
     parsed: Dict[str, Any],
     args: argparse.Namespace,
-    user: str,
-    password: str,
+    session: _BrowserSession,
     write_result_fn: Callable[[bool, Dict[str, Any]], None],
     attachment_pdf_bytes: bytes | None = None,
 ) -> None:
@@ -1433,18 +1503,6 @@ def process_single_invoice(
         print(f"SUCCESS placeholder: {parsed_name}")
         return
 
-    if not user or not password:
-        write_result_fn(
-            False,
-            {
-                "status": "failed",
-                "parsed_file": parsed_name,
-                "error": "Missing SIMPLBOOKS_USER or SIMPLBOOKS_PASSWORD",
-            },
-        )
-        print(f"FAILED {parsed_name}: missing credentials")
-        return
-
     try:
         totals_check: Dict[str, Any] = {}
         attachment_tmp: Path | None = None
@@ -1453,15 +1511,16 @@ def process_single_invoice(
                 tmp.write(attachment_pdf_bytes)
                 attachment_tmp = Path(tmp.name)
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=args.headless)
-            context = browser.new_context()
-            page = context.new_page()
-            login(page, args.base_url, user, password)
+        context = session.context()
+        page = context.new_page()
+        try:
+            # A fresh page starts blank; the session's cookies keep it
+            # logged in, so this lands straight on the dashboard.
+            page.goto(_login_url(args.base_url), wait_until="domcontentloaded")
             navigate_to_purchase_invoices(page)
             totals_check = create_invoice(page, parsed, attachment_pdf_path=attachment_tmp)
-            context.close()
-            browser.close()
+        finally:
+            page.close()
 
         if attachment_tmp is not None:
             try:
@@ -1521,23 +1580,26 @@ def local_process(args: argparse.Namespace, user: str, password: str) -> None:
         print("No *.parsed.json files found.")
         return
 
-    for parsed_path in parsed_files:
-        if has_result(parsed_path):
-            print(f"SKIP existing result: {parsed_path.name}")
-            continue
+    session = _BrowserSession(args.base_url, user, password, args.headless, _auth_state_path())
+    try:
+        for parsed_path in parsed_files:
+            if has_result(parsed_path):
+                print(f"SKIP existing result: {parsed_path.name}")
+                continue
 
-        parsed = load_parsed_invoice(parsed_path)
-        local_pdf_path = _identify_local_pdf_path(parsed_path)
-        attachment_pdf_bytes = local_pdf_path.read_bytes() if local_pdf_path is not None else None
-        process_single_invoice(
-            parsed_name=parsed_path.name,
-            parsed=parsed,
-            args=args,
-            user=user,
-            password=password,
-            write_result_fn=lambda ok, payload, p=parsed_path: write_result(p, ok=ok, payload=payload),
-            attachment_pdf_bytes=attachment_pdf_bytes,
-        )
+            parsed = load_parsed_invoice(parsed_path)
+            local_pdf_path = _identify_local_pdf_path(parsed_path)
+            attachment_pdf_bytes = local_pdf_path.read_bytes() if local_pdf_path is not None else None
+            process_single_invoice(
+                parsed_name=parsed_path.name,
+                parsed=parsed,
+                args=args,
+                session=session,
+                write_result_fn=lambda ok, payload, p=parsed_path: write_result(p, ok=ok, payload=payload),
+                attachment_pdf_bytes=attachment_pdf_bytes,
+            )
+    finally:
+        session.close()
 
 
 def remote_process(args: argparse.Namespace, user: str, password: str) -> None:
@@ -1547,37 +1609,40 @@ def remote_process(args: argparse.Namespace, user: str, password: str) -> None:
         print("No OneDrive *.parsed.json files to process.")
         return
 
-    for job in jobs:
-        parsed_name = str(job["parsed_name"])
-        process_folder = str(job["process_folder"])
-        item_id = str(job["item_id"])
+    session = _BrowserSession(args.base_url, user, password, args.headless, _auth_state_path())
+    try:
+        for job in jobs:
+            parsed_name = str(job["parsed_name"])
+            process_folder = str(job["process_folder"])
+            item_id = str(job["item_id"])
 
-        raw = download_drive_item_content(token, drive_prefix, item_id)
-        parsed = load_parsed_invoice_bytes(raw)
-        invoice_file_id = str(parsed.get("invoice_file_id") or "").strip()
-        attachment_pdf_bytes: bytes | None = None
-        if invoice_file_id:
-            try:
-                attachment_pdf_bytes = download_drive_item_content(token, drive_prefix, invoice_file_id)
-            except RuntimeError as err:
-                print(f"{process_folder}/{parsed_name}: attachment pdf download failed ({err})")
+            raw = download_drive_item_content(token, drive_prefix, item_id)
+            parsed = load_parsed_invoice_bytes(raw)
+            invoice_file_id = str(parsed.get("invoice_file_id") or "").strip()
+            attachment_pdf_bytes: bytes | None = None
+            if invoice_file_id:
+                try:
+                    attachment_pdf_bytes = download_drive_item_content(token, drive_prefix, invoice_file_id)
+                except RuntimeError as err:
+                    print(f"{process_folder}/{parsed_name}: attachment pdf download failed ({err})")
 
-        process_single_invoice(
-            parsed_name=parsed_name,
-            parsed=parsed,
-            args=args,
-            user=user,
-            password=password,
-            attachment_pdf_bytes=attachment_pdf_bytes,
-            write_result_fn=lambda ok, payload, folder=process_folder, name=parsed_name: write_onedrive_result(
-                token,
-                drive_prefix,
-                folder,
-                name,
-                ok,
-                payload,
-            ),
-        )
+            process_single_invoice(
+                parsed_name=parsed_name,
+                parsed=parsed,
+                args=args,
+                session=session,
+                attachment_pdf_bytes=attachment_pdf_bytes,
+                write_result_fn=lambda ok, payload, folder=process_folder, name=parsed_name: write_onedrive_result(
+                    token,
+                    drive_prefix,
+                    folder,
+                    name,
+                    ok,
+                    payload,
+                ),
+            )
+    finally:
+        session.close()
 
 
 def main() -> None:
@@ -1586,6 +1651,9 @@ def main() -> None:
 
     user = os.getenv("SIMPLBOOKS_USER", "").strip()
     password = os.getenv("SIMPLBOOKS_PASSWORD", "").strip()
+    if not user or not password:
+        print("FAILED: missing SIMPLBOOKS_USER or SIMPLBOOKS_PASSWORD")
+        return
 
     if args.source == "local":
         local_process(args, user, password)

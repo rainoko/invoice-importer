@@ -665,7 +665,9 @@ class TestFillSupplier:
 
 
 class TestAttachInvoicePdf:
-    def test_attach_invoice_pdf_uses_purchasecopy_input(self, tmp_path):
+    FILEPOND_SELECTOR = 'input.filepond--browser[name="data[Purchase][attachments][]"]'
+
+    def test_attach_invoice_pdf_uses_filepond_input(self, tmp_path):
         pdf = tmp_path / "invoice.pdf"
         pdf.write_bytes(b"%PDF-1.4")
 
@@ -675,7 +677,27 @@ class TestAttachInvoicePdf:
         fields.count.return_value = 1
         fields.nth.return_value = field
 
-        page.locator.side_effect = lambda sel: fields if sel == "#PurchaseCopy" else MagicMock()
+        empty = MagicMock()
+        empty.count.return_value = 0
+        page.locator.side_effect = lambda sel: fields if sel == self.FILEPOND_SELECTOR else empty
+
+        _attach_invoice_pdf(page, pdf)
+
+        field.set_input_files.assert_called_once()
+
+    def test_attach_invoice_pdf_falls_back_to_purchasecopy_input(self, tmp_path):
+        pdf = tmp_path / "invoice.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        page = MagicMock()
+        fields = MagicMock()
+        field = MagicMock()
+        fields.count.return_value = 1
+        fields.nth.return_value = field
+
+        empty = MagicMock()
+        empty.count.return_value = 0
+        page.locator.side_effect = lambda sel: fields if sel == "#PurchaseCopy" else empty
 
         _attach_invoice_pdf(page, pdf)
 
@@ -889,11 +911,24 @@ class TestClickSaveInvoice:
 
 
 class TestLogin:
-    """Test login() function"""
+    """Test login() function (email/password)"""
+
+    def test_login_skips_when_already_logged_in(self):
+        """A still-valid saved session redirects away from the login page; no
+        credentials should be filled in."""
+        page = MagicMock()
+        page.url = "https://app.simplbooks.com/rohekood/dashboard"
+
+        with patch("simplbooks_importer._login_url", return_value="https://secure.simplbooks.com/accounts/login"):
+            login(page, "https://www.simplbooks.ee", "user@test.com", "password123")
+
+        page.goto.assert_called_once()
+        page.locator.assert_not_called()
 
     def test_login_success(self):
         """Test successful login"""
         page = MagicMock()
+        page.url = "https://secure.simplbooks.com/accounts/login"
 
         email_locator = MagicMock()
         pass_locator = MagicMock()

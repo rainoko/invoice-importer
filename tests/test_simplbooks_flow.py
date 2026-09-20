@@ -91,6 +91,7 @@ class TestLocalResultFileHelpers:
 class TestNavigationAndCreateInvoice:
     def test_login_submit_button_missing(self):
         page = MagicMock()
+        page.url = "https://secure.simplbooks.com/accounts/login"
         email_locator = MagicMock()
         pass_locator = MagicMock()
         submit_locator = MagicMock()
@@ -254,82 +255,61 @@ class TestProcessSingleInvoiceAndMain:
             base_url="https://www.simplbooks.ee",
         )
         recorder = []
+        session = MagicMock()
 
         sbi.process_single_invoice(
             parsed_name="target.parsed.json",
             parsed={},
             args=args,
-            user="",
-            password="",
+            session=session,
             write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
         )
 
         assert recorder and recorder[0][0] is True
         assert recorder[0][1]["mode"] == "dry-run-no-submit"
+        session.context.assert_not_called()
 
     def test_process_single_invoice_placeholder(self):
         args = MagicMock(test_file="target.parsed.json", headless=True, base_url="https://www.simplbooks.ee")
         recorder = []
+        session = MagicMock()
 
         sbi.process_single_invoice(
             parsed_name="other.parsed.json",
             parsed={},
             args=args,
-            user="u",
-            password="p",
+            session=session,
             write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
         )
 
         assert recorder and recorder[0][0] is True
         assert recorder[0][1]["mode"] == "placeholder-no-submit"
-
-    def test_process_single_invoice_missing_credentials(self):
-        args = MagicMock(test_file="target.parsed.json", headless=True, base_url="https://www.simplbooks.ee")
-        recorder = []
-
-        sbi.process_single_invoice(
-            parsed_name="target.parsed.json",
-            parsed={},
-            args=args,
-            user="",
-            password="",
-            write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
-        )
-
-        assert recorder and recorder[0][0] is False
-        assert "Missing SIMPLBOOKS_USER" in recorder[0][1]["error"]
+        session.context.assert_not_called()
 
     def test_process_single_invoice_live_when_test_file_unset(self):
         args = MagicMock(test_file=None, headless=True, base_url="https://www.simplbooks.ee")
         parsed = {"invoice_data": {"invoice_number": "INV-LIVE"}}
         recorder = []
 
-        play = MagicMock()
-        browser = MagicMock()
+        session = MagicMock()
         context = MagicMock()
         page = MagicMock()
-        play.chromium.launch.return_value = browser
-        browser.new_context.return_value = context
+        session.context.return_value = context
         context.new_page.return_value = page
 
-        cm = MagicMock()
-        cm.__enter__.return_value = play
-        cm.__exit__.return_value = False
-
-        with patch("simplbooks_importer.sync_playwright", return_value=cm), \
-            patch("simplbooks_importer.login"), \
-            patch("simplbooks_importer.navigate_to_purchase_invoices"), \
+        with patch("simplbooks_importer.navigate_to_purchase_invoices"), \
             patch("simplbooks_importer.create_invoice", return_value={"difference_cents": 0}) as create_invoice:
             sbi.process_single_invoice(
                 parsed_name="any.parsed.json",
                 parsed=parsed,
                 args=args,
-                user="u",
-                password="p",
+                session=session,
                 write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
             )
 
         create_invoice.assert_called_once()
+        page.goto.assert_called_once()
+        page.close.assert_called_once()
         assert recorder and recorder[0][0] is True
         assert recorder[0][1]["mode"] == "submitted"
 
@@ -338,28 +318,19 @@ class TestProcessSingleInvoiceAndMain:
         parsed = {"invoice_data": {"invoice_number": "INV-1"}}
         recorder = []
 
-        play = MagicMock()
-        browser = MagicMock()
+        session = MagicMock()
         context = MagicMock()
         page = MagicMock()
-        play.chromium.launch.return_value = browser
-        browser.new_context.return_value = context
+        session.context.return_value = context
         context.new_page.return_value = page
 
-        cm = MagicMock()
-        cm.__enter__.return_value = play
-        cm.__exit__.return_value = False
-
-        with patch("simplbooks_importer.sync_playwright", return_value=cm), \
-            patch("simplbooks_importer.login"), \
-            patch("simplbooks_importer.navigate_to_purchase_invoices"), \
+        with patch("simplbooks_importer.navigate_to_purchase_invoices"), \
             patch("simplbooks_importer.create_invoice", return_value={"difference_cents": 5}):
             sbi.process_single_invoice(
                 parsed_name="target.parsed.json",
                 parsed=parsed,
                 args=args,
-                user="u",
-                password="p",
+                session=session,
                 write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
             )
 
@@ -372,28 +343,19 @@ class TestProcessSingleInvoiceAndMain:
         parsed = {"invoice_data": {"invoice_number": "INV-2"}}
         recorder = []
 
-        play = MagicMock()
-        browser = MagicMock()
+        session = MagicMock()
         context = MagicMock()
         page = MagicMock()
-        play.chromium.launch.return_value = browser
-        browser.new_context.return_value = context
+        session.context.return_value = context
         context.new_page.return_value = page
 
-        cm = MagicMock()
-        cm.__enter__.return_value = play
-        cm.__exit__.return_value = False
-
-        with patch("simplbooks_importer.sync_playwright", return_value=cm), \
-            patch("simplbooks_importer.login"), \
-            patch("simplbooks_importer.navigate_to_purchase_invoices"), \
+        with patch("simplbooks_importer.navigate_to_purchase_invoices"), \
             patch("simplbooks_importer.create_invoice", return_value={"difference_cents": 1}):
             sbi.process_single_invoice(
                 parsed_name="target.parsed.json",
                 parsed=parsed,
                 args=args,
-                user="u",
-                password="p",
+                session=session,
                 write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
             )
 
@@ -404,19 +366,16 @@ class TestProcessSingleInvoiceAndMain:
         args = MagicMock(test_file="target.parsed.json", headless=True, base_url="https://www.simplbooks.ee")
         recorder = []
 
-        cm = MagicMock()
-        cm.__enter__.side_effect = RuntimeError("browser fail")
-        cm.__exit__.return_value = False
+        session = MagicMock()
+        session.context.side_effect = RuntimeError("browser fail")
 
-        with patch("simplbooks_importer.sync_playwright", return_value=cm):
-            sbi.process_single_invoice(
-                parsed_name="target.parsed.json",
-                parsed={},
-                args=args,
-                user="u",
-                password="p",
-                write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
-            )
+        sbi.process_single_invoice(
+            parsed_name="target.parsed.json",
+            parsed={},
+            args=args,
+            session=session,
+            write_result_fn=lambda ok, payload: recorder.append((ok, payload)),
+        )
 
         assert recorder and recorder[0][0] is False
         assert "browser fail" in recorder[0][1]["error"]
@@ -473,6 +432,19 @@ class TestProcessSingleInvoiceAndMain:
             sbi.main()
 
         proc.assert_not_called()
+
+    def test_main_missing_credentials_skips_processing(self, tmp_path):
+        args = MagicMock(source="local", input_dir=str(tmp_path), base_url="https://www.simplbooks.ee")
+
+        with patch("simplbooks_importer.parse_args", return_value=args), \
+            patch("simplbooks_importer.load_dotenv"), \
+            patch("simplbooks_importer.local_process") as local_proc, \
+            patch("simplbooks_importer.remote_process") as remote_proc, \
+            patch.dict("os.environ", {}, clear=True):
+            sbi.main()
+
+        local_proc.assert_not_called()
+        remote_proc.assert_not_called()
 
     def test_main_onedrive_path_with_job(self):
         args = MagicMock(

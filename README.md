@@ -154,6 +154,14 @@ Provider-specific requirements:
 
 ### SimplBooks (`simplbooks_importer.py`)
 
+Logs in with email/password. SimplBooks also has a "Sign in with Google"
+button, but that isn't used here: Google's bot detection blocks the OAuth
+flow for an automation-launched browser (it eventually shows "This browser
+or app may not be secure"), even with a human present to click through it —
+confirmed by testing it live. One login is reused for every invoice in a
+run, and persisted to disk so a still-valid session skips logging in again
+on the next run.
+
 Required:
 
 - `SIMPLBOOKS_USER`
@@ -168,6 +176,8 @@ Required:
 Optional:
 
 - `SIMPLBOOKS_BASE_URL` (defaults to `https://www.simplbooks.ee`)
+- `SIMPLBOOKS_AUTH_STATE_PATH` (defaults to `simplbooks_auth_state.json`) — where the
+  logged-in browser session is persisted. Delete this file to force a fresh login.
 
 Important:
 
